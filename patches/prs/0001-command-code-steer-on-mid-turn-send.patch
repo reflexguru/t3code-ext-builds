@@ -1,0 +1,675 @@
+Command Code: keep mid-turn sends, keep Stop a clean abort, and never drop a
+message silently.
+
+Upstream PR #10861 rejects a `sendTurn` that arrives while a turn is running
+("a turn is already running for this thread"). Every other provider adapter
+treats that as a steer, and T3 clients send mid-turn messages on purpose, so
+the message is dropped and the thread records a turn-start failure (observed
+2026-09-16 while a long turn was in flight). Its interrupt path is broken too:
+a child killed by a signal never reports an exit code, the Node spawner fails
+the wait with a PlatformError, and the turn surfaces as a provider process
+failure instead of an abort — which is what Stop hits.
+
+Command Code headless mode takes one prompt per `-p` process, so a steer cannot
+reach the live child. The adapter now queues it on the active run and runs it as
+the same turn once that process exits, resuming the same Command Code session —
+no new `turn.started`, one `turn.completed` when the queue is empty. The queue
+check and the release share a single update so a steer can never land on a run
+that will not drain again. A missing exit code is folded back into the exit-code
+decision so an interrupt stays an abort. When a turn ends early (failed or
+stopped) the queue dies with it, so the run names the undelivered messages in
+its error text and abort reason instead of leaving them looking delivered.
+
+--- a/apps/server/src/provider/Layers/CommandCodeAdapter.ts
++++ b/apps/server/src/provider/Layers/CommandCodeAdapter.ts
+@@ -7,6 +7,12 @@
+  * parses the NDJSON event stream on stdout live, and folds it into canonical
+  * `ProviderRuntimeEvent`s. A turn ends when the subprocess exits.
+  *
++ * A `sendTurn` that lands while a turn is running is a steer, like every other
++ * adapter: the prompt is queued on the active run and starts its own process as
++ * soon as the one in flight exits, resuming the same Command Code session under
++ * the same turn id. Print mode takes one prompt per process, so the message
++ * cannot reach the live child — but it is never rejected or dropped.
++ *
+  * Headless print mode cannot surface interactive approvals, so the adapter
+  * never opens requests: it inherits the CLI's permission policy from the
+  * instance's `permissionMode` setting (`--yolo` for auto-accept, nothing for
+@@ -43,7 +49,6 @@
+ 
+ import {
+   ProviderAdapterProcessError,
+-  ProviderAdapterRequestError,
+   ProviderAdapterSessionNotFoundError,
+   ProviderAdapterValidationError,
+   type ProviderAdapterError,
+@@ -235,12 +240,26 @@
+   readonly cancel: { requested: boolean };
+   /** Null between the atomic reservation and the process actually spawning. */
+   child: TurnChildHandle | null;
++  /**
++   * Prompts that arrived while this run's process was still working. Headless
++   * print mode takes exactly one prompt per process, so a steer cannot reach
++   * the live CLI: it waits here and runs as the same turn once the current
++   * process exits. FIFO, drained by the run's owner.
++   */
++  readonly queuedPrompts: ReadonlyArray<QueuedPrompt>;
++}
++
++/** One prompt waiting behind a running Command Code process. */
++interface QueuedPrompt {
++  readonly text: string;
++  readonly model: string | undefined;
+ }
+ 
+ /** Structural view of the spawner's child handle, kept wide so the adapter
+  * stays independent of the process module's exact stream/sink generics. */
+ interface TurnChildHandle {
+-  readonly exitCode: Effect.Effect<number>;
++  /** Fails when the process was terminated by a signal rather than exiting. */
++  readonly exitCode: Effect.Effect<number, unknown>;
+   readonly kill: (options?: { readonly forceKillAfter?: unknown }) => Effect.Effect<void>;
+   readonly stdout: Stream.Stream<Uint8Array, never>;
+   readonly stderr: Stream.Stream<Uint8Array, never>;
+@@ -249,6 +268,16 @@
+ 
+ type TurnOutcome = "completed" | "interrupted" | "failed";
+ 
++/** How one `sendTurn` call related to the thread's in-flight work. */
++type TurnAdmission = "reserved" | "queued" | "missing";
++
++/** What one CLI process contributed to the turn that owns it. */
++interface SinglePromptResult {
++  readonly outcome: TurnOutcome;
++  readonly usage: UsageTotals | undefined;
++  readonly stopReason: string | undefined;
++}
++
+ export function makeCommandCodeAdapter(
+   config: CommandCodeSettings,
+   options: CommandCodeAdapterOptions,
+@@ -391,26 +420,125 @@
+         : activeRun.child.kill({ forceKillAfter: "2 seconds" }).pipe(Effect.ignore);
+ 
+     /**
+-     * Atomically reserve the thread for one turn. Two concurrent `sendTurn`
+-     * calls for the same thread cannot both pass this gate, so turns never
+-     * overlap even though spawning happens afterwards.
++     * Admit one `sendTurn` against the thread. The first caller reserves the
++     * turn with an empty queue — it runs its own prompt directly — while anyone
++     * arriving after it joins as a steer, because every other adapter folds a
++     * mid-turn message into the running turn and the CLI takes one prompt per
++     * process. Turns therefore never overlap, and a steer is never dropped.
+      */
+-    const reserveTurn = (threadId: ThreadId, turnId: TurnId): Effect.Effect<boolean> =>
++    const admitTurn = (input: {
++      readonly threadId: ThreadId;
++      readonly turnId: TurnId;
++      readonly prompt: QueuedPrompt;
++    }): Effect.Effect<TurnAdmission> =>
++      Ref.modify(sessions, (map) => {
++        const session = map.get(input.threadId);
++        if (session === undefined) {
++          return ["missing", map] as const;
++        }
++        const active = session.activeRun;
++        if (active === null) {
++          return [
++            "reserved",
++            new Map(map).set(input.threadId, {
++              ...session,
++              activeRun: {
++                turnId: input.turnId,
++                cancel: { requested: false },
++                child: null,
++                queuedPrompts: [],
++              },
++            }),
++          ] as const;
++        }
++        return [
++          "queued",
++          new Map(map).set(input.threadId, {
++            ...session,
++            activeRun: { ...active, queuedPrompts: [...active.queuedPrompts, input.prompt] },
++          }),
++        ] as const;
++      });
++
++    /**
++     * Hand the settled prompt's run the next queued one, or release the thread
++     * when nothing is waiting. Both outcomes share one update so a steer landing
++     * as the run ends either joins this run or starts a fresh turn — it can
++     * never be appended to a run that will not drain again.
++     */
++    const takeNextPromptOrRelease = (
++      threadId: ThreadId,
++      turnId: TurnId,
++    ): Effect.Effect<QueuedPrompt | null> =>
+       Ref.modify(sessions, (map) => {
+         const session = map.get(threadId);
+-        if (session === undefined || session.activeRun !== null) {
+-          return [false, map] as const;
++        if (
++          session === undefined ||
++          session.activeRun === null ||
++          session.activeRun.turnId !== turnId
++        ) {
++          return [null, map] as const;
++        }
++        const active = session.activeRun;
++        const next = active.queuedPrompts[0];
++        if (next === undefined) {
++          return [null, new Map(map).set(threadId, { ...session, activeRun: null })] as const;
+         }
+         return [
+-          true,
++          next,
+           new Map(map).set(threadId, {
+             ...session,
+-            activeRun: { turnId, cancel: { requested: false }, child: null },
++            activeRun: { ...active, child: null, queuedPrompts: active.queuedPrompts.slice(1) },
+           }),
+         ] as const;
+       });
+ 
+-    const runTurnRaw = (input: {
++    /** Steered prompts still waiting on the run that owns this turn. */
++    const pendingSteerCount = (threadId: ThreadId, turnId: TurnId): Effect.Effect<number> =>
++      Ref.get(sessions).pipe(
++        Effect.map((map) => {
++          const active = map.get(threadId)?.activeRun;
++          return active !== null && active !== undefined && active.turnId === turnId
++            ? active.queuedPrompts.length
++            : 0;
++        }),
++      );
++
++    /**
++     * A turn that ends early takes its queue with it. Name what was lost: the
++     * undelivered messages stay in the thread looking delivered, and a silent
++     * drop is how a user ends up waiting on an answer that never comes.
++     */
++    const undeliveredSteerNote = (threadId: ThreadId, turnId: TurnId): Effect.Effect<string> =>
++      pendingSteerCount(threadId, turnId).pipe(
++        Effect.map((pending) =>
++          pending === 0
++            ? ""
++            : `${pending} message${pending === 1 ? "" : "s"} sent while this turn ran ${
++                pending === 1 ? "was" : "were"
++              } not delivered; resend to continue.`,
++        ),
++      );
++
++    /** `turn.aborted` payload whose reason names any steered prompts it drops. */
++    const interruptAbortPayload = (
++      threadId: ThreadId,
++      turnId: TurnId,
++      extra: Record<string, unknown>,
++    ): Effect.Effect<Record<string, unknown>> =>
++      undeliveredSteerNote(threadId, turnId).pipe(
++        Effect.map((note) => ({
++          reason: note.length === 0 ? "interrupted" : `interrupted. ${note}`,
++          ...extra,
++        })),
++      );
++
++    /**
++     * Run one prompt through one CLI process and fold its stream into runtime
++     * events. A run keeps its turn open on success: the turn's owner decides
++     * whether another queued prompt continues it or the turn completes.
++     */
++    const runSinglePrompt = (input: {
+       readonly threadId: ThreadId;
+       readonly turnId: TurnId;
+       readonly prompt: string;
+@@ -427,13 +555,6 @@
+         }
+         const runCancel = session.activeRun.cancel;
+ 
+-        yield* offer({
+-          type: "turn.started",
+-          threadId: input.threadId,
+-          turnId: input.turnId,
+-          payload: input.model === undefined ? {} : { model: input.model },
+-        });
+-
+         const args = commandCodeTurnArgs({
+           permissionMode: config.permissionMode,
+           model: input.model,
+@@ -462,24 +583,26 @@
+           // local child and end the turn as interrupted instead of running it.
+           runCancel.requested = true;
+           yield* child.kill({ forceKillAfter: "2 seconds" }).pipe(Effect.ignore);
++          const payload = yield* interruptAbortPayload(input.threadId, input.turnId, {});
+           yield* offer({
+             type: "turn.aborted",
+             threadId: input.threadId,
+             turnId: input.turnId,
+-            payload: { reason: "interrupted" },
++            payload,
+           });
+-          return "interrupted" as const;
++          return { outcome: "interrupted", usage: undefined, stopReason: undefined } as const;
+         }
+         // A delayed interrupt may have landed before the child spawned.
+         if (runCancel.requested) {
+           yield* child.kill({ forceKillAfter: "2 seconds" }).pipe(Effect.ignore);
++          const payload = yield* interruptAbortPayload(input.threadId, input.turnId, {});
+           yield* offer({
+             type: "turn.aborted",
+             threadId: input.threadId,
+             turnId: input.turnId,
+-            payload: { reason: "interrupted" },
++            payload,
+           });
+-          return "interrupted" as const;
++          return { outcome: "interrupted", usage: undefined, stopReason: undefined } as const;
+         }
+ 
+         // Stream the prompt over stdin; Command Code auto-detects piped input.
+@@ -743,7 +866,22 @@
+ 
+         // Run the parse loops alongside the exit wait; all three finish when
+         // the subprocess closes its pipes.
+-        const [, , exitRaw] = yield* Effect.all([stdoutLoop, stderrLoop, child.exitCode], {
++        //
++        // A child that dies from a signal has no exit code: the Node spawner
++        // fails the wait with a PlatformError instead of reporting one, which
++        // is what an interrupt (or any externally killed process) looks like.
++        // Fold that back into the exit-code decision so Stop stays an abort
++        // instead of surfacing as a provider process failure.
++        const exitWait = child.exitCode.pipe(
++          Effect.catch((error) =>
++            Effect.sync(() => {
++              const next = `${stderrTail}\n${String(error)}`.trim();
++              stderrTail = next.length > 8_000 ? next.slice(next.length - 8_000) : next;
++              return -1;
++            }),
++          ),
++        );
++        const [, , exitRaw] = yield* Effect.all([stdoutLoop, stderrLoop, exitWait], {
+           concurrency: "unbounded",
+         });
+         const exitCode = typeof exitRaw === "number" ? exitRaw : Number(exitRaw);
+@@ -768,37 +906,28 @@
+         }
+ 
+         if (wasInterrupted) {
++          const payload = yield* interruptAbortPayload(
++            input.threadId,
++            input.turnId,
++            usage !== undefined ? { tokenUsage: toTurnTokenUsage(usage) } : {},
++          );
+           yield* offer({
+             type: "turn.aborted",
+             threadId: input.threadId,
+             turnId: input.turnId,
+-            payload: {
+-              reason: "interrupted",
+-              ...(usage !== undefined ? { tokenUsage: toTurnTokenUsage(usage) } : {}),
+-            },
++            payload,
+           });
+-          return "interrupted" as const;
++          return { outcome: "interrupted", usage, stopReason: undefined } as const;
+         }
+ 
+         if (resultSubtype !== "error" && (resultSubtype === "success" || exitCode === 0)) {
+-          yield* offer({
+-            type: "turn.completed",
+-            threadId: input.threadId,
+-            turnId: input.turnId,
+-            payload: {
+-              state: "completed",
+-              ...(resultStopReason !== undefined ? { stopReason: resultStopReason } : {}),
+-              ...(usage !== undefined ? { tokenUsage: toTurnTokenUsage(usage), usage } : {}),
+-            },
+-          });
+-          if (usage !== undefined) {
+-            yield* offer({
+-              type: "thread.token-usage.updated",
+-              threadId: input.threadId,
+-              payload: { usage: toThreadUsageSnapshot(usage) },
+-            });
+-          }
+-          return "completed" as const;
++          // The owner emits turn.completed once the queue is empty: a steered
++          // prompt continues this turn instead of closing and reopening it.
++          return {
++            outcome: "completed",
++            usage,
++            stopReason: resultStopReason,
++          } as const;
+         }
+ 
+         // Failure path. Prefer a structured message from stderr; exit codes
+@@ -808,11 +937,12 @@
+           resultSubtype === "error"
+             ? `Command Code turn failed${exitCode !== 0 ? ` (exit ${exitCode})` : ""}`
+             : `Command Code exited with code ${exitCode}`;
+-        const message = (
+-          typeof stderrMessage === "string" && stderrMessage.length > 0
++        const undeliveredNote = yield* undeliveredSteerNote(input.threadId, input.turnId);
++        const message =
++          (typeof stderrMessage === "string" && stderrMessage.length > 0
+             ? `${detail}: ${stderrMessage}`
+             : detail
+-        ).slice(0, 2_000);
++          ).slice(0, 1_900) + (undeliveredNote.length === 0 ? "" : ` ${undeliveredNote}`);
+         const errorClass =
+           exitCode === 3 || exitCode === 4
+             ? ("permission_error" as const)
+@@ -834,7 +964,80 @@
+           turnId: input.turnId,
+           payload: { state: "failed", errorMessage: message },
+         });
+-        return "failed" as const;
++        return { outcome: "failed", usage: undefined, stopReason: undefined } as const;
++      });
++
++    /**
++     * Drive one reserved turn to its end. The reserving prompt starts the turn;
++     * every prompt queued behind it while a process ran (a steer) continues the
++     * same turn once that process exits, so a mid-turn message is answered
++     * instead of failing the user's send.
++     */
++    const runTurnRaw = (input: {
++      readonly threadId: ThreadId;
++      readonly turnId: TurnId;
++      readonly prompt: string;
++      readonly model: string | undefined;
++    }) =>
++      Effect.gen(function* () {
++        // Retiring the run (a session restart) between admission and here must
++        // fail before the turn announces itself.
++        const reserved = yield* getSession(input.threadId);
++        if (reserved.activeRun === null || reserved.activeRun.turnId !== input.turnId) {
++          return yield* new ProviderAdapterValidationError({
++            provider: driverKind,
++            operation: "sendTurn",
++            issue: "turn was not reserved for this thread",
++          });
++        }
++
++        yield* offer({
++          type: "turn.started",
++          threadId: input.threadId,
++          turnId: input.turnId,
++          payload: input.model === undefined ? {} : { model: input.model },
++        });
++
++        let prompt: QueuedPrompt = { text: input.prompt, model: input.model };
++        let usage: UsageTotals | undefined;
++        for (;;) {
++          const result: SinglePromptResult = yield* runSinglePrompt({
++            threadId: input.threadId,
++            turnId: input.turnId,
++            prompt: prompt.text,
++            model: prompt.model,
++          });
++          usage = result.usage ?? usage;
++          if (result.outcome !== "completed") {
++            // The owner's release drops anything still queued: the turn already
++            // reported why it ended, and a failed or stopped turn must not keep
++            // replaying the queue.
++            return result.outcome;
++          }
++
++          const next = yield* takeNextPromptOrRelease(input.threadId, input.turnId);
++          if (next === null) {
++            yield* offer({
++              type: "turn.completed",
++              threadId: input.threadId,
++              turnId: input.turnId,
++              payload: {
++                state: "completed",
++                ...(result.stopReason !== undefined ? { stopReason: result.stopReason } : {}),
++                ...(usage !== undefined ? { tokenUsage: toTurnTokenUsage(usage), usage } : {}),
++              },
++            });
++            if (usage !== undefined) {
++              yield* offer({
++                type: "thread.token-usage.updated",
++                threadId: input.threadId,
++                payload: { usage: toThreadUsageSnapshot(usage) },
++              });
++            }
++            return "completed" as const;
++          }
++          prompt = next;
++        }
+       });
+ 
+     const runTurn = (input: {
+@@ -911,8 +1114,8 @@
+       sendTurn: (input: ProviderSendTurnInput) =>
+         Effect.gen(function* () {
+           const session = yield* getSession(input.threadId);
+-          const prompt = input.input ?? (input.continuation === true ? "Continue." : "");
+-          if (prompt.trim().length === 0) {
++          const promptText = input.input ?? (input.continuation === true ? "Continue." : "");
++          if (promptText.trim().length === 0) {
+             return yield* new ProviderAdapterValidationError({
+               provider: driverKind,
+               operation: "sendTurn",
+@@ -920,23 +1123,45 @@
+             });
+           }
+           const model = input.modelSelection?.model ?? session.model;
+-          const turnId = (yield* nextId()) as TurnId;
+-          const reserved = yield* reserveTurn(input.threadId, turnId);
+-          if (!reserved) {
+-            return yield* new ProviderAdapterRequestError({
++          const candidateTurnId = (yield* nextId()) as TurnId;
++          const admission = yield* admitTurn({
++            threadId: input.threadId,
++            turnId: candidateTurnId,
++            prompt: { text: promptText, model },
++          });
++          if (admission === "missing") {
++            return yield* new ProviderAdapterSessionNotFoundError({
+               provider: driverKind,
+-              method: "sendTurn",
+-              detail: "a turn is already running for this thread",
++              threadId: input.threadId,
+             });
+           }
+-          const outcome = yield* runTurn({ threadId: input.threadId, turnId, prompt, model }).pipe(
+-            Effect.ensuring(releaseTurn(input.threadId, turnId)),
+-          );
++          if (admission === "queued") {
++            // A steer joins the turn already in flight: same turn id, no new
++            // turn.started, and this call returns as soon as the prompt is
++            // accepted. The live process cannot take it, so the run's owner
++            // starts it the moment that process exits, resuming the same
++            // Command Code session.
++            const current = yield* getSession(input.threadId);
++            const steeringResult: ProviderTurnStartResult = {
++              threadId: input.threadId,
++              turnId: current.activeRun?.turnId ?? candidateTurnId,
++              ...(current.commandCodeSessionId !== undefined
++                ? { resumeCursor: { sessionId: current.commandCodeSessionId } }
++                : {}),
++            };
++            return steeringResult;
++          }
++          const outcome = yield* runTurn({
++            threadId: input.threadId,
++            turnId: candidateTurnId,
++            prompt: promptText,
++            model,
++          }).pipe(Effect.ensuring(releaseTurn(input.threadId, candidateTurnId)));
+           void outcome;
+           const updated = yield* getSession(input.threadId);
+           const providerResult: ProviderTurnStartResult = {
+             threadId: input.threadId,
+-            turnId,
++            turnId: candidateTurnId,
+             ...(updated.commandCodeSessionId !== undefined
+               ? { resumeCursor: { sessionId: updated.commandCodeSessionId } }
+               : {}),
+--- a/apps/server/src/provider/Layers/CommandCodeAdapter.test.ts
++++ b/apps/server/src/provider/Layers/CommandCodeAdapter.test.ts
+@@ -135,6 +135,133 @@
+     }
+   }, 30_000);
+ 
++  it("queues a mid-turn send as a steer and runs it in the same turn", async () => {
++    const harness = prepareMockHarness();
++    try {
++      await runScoped(
++        Effect.gen(function* () {
++          const instanceId = ProviderInstanceId.make("commandCodeTest");
++          const threadId = ThreadId.make("thread-steer");
++          const adapter = yield* makeCommandCodeAdapter(makeConfig(harness.binaryPath), {
++            driverKind: ProviderDriverKind.make("commandCode"),
++            instanceId,
++            environment: {
++              ...process.env,
++              T3_MOCK_ARGV_LOG: harness.argvLogPath,
++              // Both runs hold after their first chunk, so the steer always
++              // lands while a child is still working.
++              T3_MOCK_HANG: "1",
++            },
++          });
++          yield* adapter.startSession({ threadId, cwd: harness.cwd, runtimeMode: "full-access" });
++
++          const eventsFiber = yield* Effect.forkScoped(
++            Stream.runCollect(
++              adapter.streamEvents.pipe(
++                Stream.takeUntil((event) => event.type === "turn.completed"),
++              ),
++            ),
++          );
++          const turnStartedFiber = yield* Effect.forkScoped(
++            adapter.streamEvents.pipe(
++              Stream.takeUntil((event) => event.type === "turn.started"),
++              Stream.runDrain,
++            ),
++          );
++          const firstFiber = yield* Effect.forkScoped(
++            adapter.sendTurn({ threadId, input: "primero" }),
++          );
++          // Wait until the turn is reserved and its process is streaming before
++          // sending the follow-up mid-turn.
++          yield* Fiber.join(turnStartedFiber);
++          yield* adapter.streamEvents.pipe(
++            Stream.takeUntil((event) => event.type === "content.delta"),
++            Stream.runDrain,
++          );
++
++          const steered = yield* adapter.sendTurn({ threadId, input: "segundo" });
++
++          const first = yield* Fiber.join(firstFiber);
++          const events = Array.from(yield* Fiber.join(eventsFiber));
++
++          // Steering continues the running turn instead of failing the send.
++          expect(steered.turnId).toBe(first.turnId);
++          expect(events.filter((event) => event.type === "turn.started")).toHaveLength(1);
++          expect(events.at(-1)?.type).toBe("turn.completed");
++
++          // The queued prompt ran after the first process exited, resuming the
++          // same Command Code session.
++          const steeredArgv = readArgvLog(harness.argvLogPath);
++          expect(steeredArgv.prompt).toBe("segundo");
++          expect(steeredArgv.argv).toContain("--resume");
++          expect(steeredArgv.argv).toContain("mock-session-1");
++        }),
++      );
++    } finally {
++      harness.cleanup();
++    }
++  }, 30_000);
++
++  it("names the mid-turn messages a failed turn never delivered", async () => {
++    const harness = prepareMockHarness();
++    try {
++      await runScoped(
++        Effect.gen(function* () {
++          const instanceId = ProviderInstanceId.make("commandCodeTest");
++          const threadId = ThreadId.make("thread-failed-steer");
++          const adapter = yield* makeCommandCodeAdapter(makeConfig(harness.binaryPath), {
++            driverKind: ProviderDriverKind.make("commandCode"),
++            instanceId,
++            environment: {
++              ...process.env,
++              T3_MOCK_ARGV_LOG: harness.argvLogPath,
++              // Hold the first process, then fail the run while a steer waits.
++              T3_MOCK_HANG: "1",
++              T3_MOCK_EXIT_CODE: "8",
++            },
++          });
++          yield* adapter.startSession({ threadId, cwd: harness.cwd, runtimeMode: "full-access" });
++
++          const eventsFiber = yield* Effect.forkScoped(
++            Stream.runCollect(
++              adapter.streamEvents.pipe(
++                Stream.takeUntil((event) => event.type === "turn.completed"),
++              ),
++            ),
++          );
++          const turnStartedFiber = yield* Effect.forkScoped(
++            adapter.streamEvents.pipe(
++              Stream.takeUntil((event) => event.type === "turn.started"),
++              Stream.runDrain,
++            ),
++          );
++          const sendFiber = yield* Effect.forkScoped(
++            adapter.sendTurn({ threadId, input: "primero" }),
++          );
++          yield* Fiber.join(turnStartedFiber);
++          yield* adapter.streamEvents.pipe(
++            Stream.takeUntil((event) => event.type === "content.delta"),
++            Stream.runDrain,
++          );
++          // Steers onto the run that is about to fail; the queue dies with it.
++          yield* adapter.sendTurn({ threadId, input: "segundo" });
++
++          yield* Fiber.join(sendFiber);
++          const events = Array.from(yield* Fiber.join(eventsFiber));
++          const terminal = events.at(-1);
++          expect(terminal?.type).toBe("turn.completed");
++          const failed = terminal?.type === "turn.completed" ? terminal.payload : undefined;
++          expect(failed?.state).toBe("failed");
++          expect(String(failed?.errorMessage)).toContain(
++            "1 message sent while this turn ran was not delivered; resend to continue.",
++          );
++        }),
++      );
++    } finally {
++      harness.cleanup();
++    }
++  }, 30_000);
++
+   it("interrupts an in-flight turn and emits turn.aborted", async () => {
+     const harness = prepareMockHarness();
+     try {
+--- a/apps/server/src/provider/testFixtures/commandCodeHeadless/commandcode-mock-agent.cjs
++++ b/apps/server/src/provider/testFixtures/commandCodeHeadless/commandcode-mock-agent.cjs
+@@ -9,6 +9,7 @@
+  *   T3_MOCK_SESSION   session id to report (default "mock-session-1")
+  *   T3_MOCK_HANG=1    stop emitting after the first message chunk and hold
+  *                     the process open until killed (interrupt tests)
++ *   T3_MOCK_EXIT_CODE finish with this exit code (default 0), for failure tests
+  */
+ "use strict";
+ 
+@@ -17,6 +18,8 @@
+ const sessionId = process.env.T3_MOCK_SESSION || "mock-session-1";
+ const argvLogPath = process.env.T3_MOCK_ARGV_LOG;
+ const hang = process.env.T3_MOCK_HANG === "1";
++const exitCode = Number.parseInt(process.env.T3_MOCK_EXIT_CODE || "0", 10);
++process.exitCode = Number.isNaN(exitCode) ? 0 : exitCode;
+ 
+ let prompt = "";
+ process.stdin.setEncoding("utf8");
+@@ -46,7 +49,7 @@
+     // us. If the kill does not reach the node process, this bounds the wait.
+     process.stdout.write("", () => {
+       setTimeout(() => {
+-        process.exit(0);
++        process.exit(process.exitCode ?? 0);
+       }, 4_000);
+     });
+     return;

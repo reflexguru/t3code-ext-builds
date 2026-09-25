@@ -1,0 +1,39 @@
+name: Build T3 Code v2 orchestrator nightly (Windows)
+
+# Builds the v2 orchestrator branch head (pull request #2829) from source
+# and publishes a Windows NSIS installer. The branch trails main, so this
+# flavor pins that commit instead of merging onto a newer nightly tag.
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if this orchestrator revision was already recorded
+        required: false
+        default: false
+        type: boolean
+      pr_refs:
+        description: Space separated upstream pull request refs; the first ref is the pinned source
+        required: false
+        default: refs/pull/2829/head
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: t3code-v2-windows-nightly
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-layered-windows.yml
+    with:
+      flavor: v2
+      source_mode: pin
+      test_kind: v2-command-code-optional
+      pr_refs: ${{ inputs.pr_refs || 'refs/pull/2829/head' }}
+      force: ${{ inputs.force || false }}
+    secrets: inherit

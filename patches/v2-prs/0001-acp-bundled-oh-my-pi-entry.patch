@@ -1,0 +1,222 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: slopfire <hgrmeanwhile@gmail.com>
+Subject: [PATCH] feat(acp): surface a bundled Oh My Pi registry entry
+
+Refresh the ACP registry implementation and tests against the current v2
+orchestrator source, including its required toolsDir test configuration.
+
+diff --git a/apps/server/src/provider/acp/AcpRegistrySupport.test.ts b/apps/server/src/provider/acp/AcpRegistrySupport.test.ts
+index c276dcd83..27e24bb21 100644
+--- a/apps/server/src/provider/acp/AcpRegistrySupport.test.ts
++++ b/apps/server/src/provider/acp/AcpRegistrySupport.test.ts
+@@ -835,7 +835,8 @@ describe("AcpRegistrySupport", () => {
+       });
+       const result = yield* resolver.search({ query: "" });
+ 
+-      expect(result.agents.map((agent) => agent.id)).toEqual([valid.id]);
++      // The bundled agents also appear in unfiltered searches.
++      expect(result.agents.map((agent) => agent.id)).toEqual([valid.id, "omp"]);
+     }).pipe(
+       Effect.scoped,
+       Effect.provide(
+@@ -856,6 +857,105 @@ describe("AcpRegistrySupport", () => {
+     );
+   });
+ 
++  it.effect("surfaces the bundled Oh My Pi entry when the Registry lacks it", () => {
++    return Effect.gen(function* () {
++      const fileSystem = yield* FileSystem.FileSystem;
++      const cacheDir = yield* fileSystem.makeTempDirectoryScoped({
++        prefix: "t3-acp-registry-bundled-",
++      });
++      const resolver = yield* makeAcpRegistryCatalog({
++        cacheDir,
++        toolsDir: `${cacheDir}/tools`,
++        registryUrl,
++      });
++      const result = yield* resolver.search({ query: "omp" });
++
++      expect(result.agents).toHaveLength(1);
++      expect(result.agents[0]).toMatchObject({
++        id: "omp",
++        name: "Oh My Pi",
++        version: "18.2.3",
++        distribution: "npx",
++        license: "MIT",
++        repository: "https://github.com/can1357/oh-my-pi",
++      });
++    }).pipe(
++      Effect.scoped,
++      Effect.provide(
++        resolverLayer((request) =>
++          Effect.succeed(
++            HttpClientResponse.fromWeb(
++              request,
++              new Response(JSON.stringify({ version: "1.0.0", agents: [] })),
++            ),
++          ),
++        ),
++      ),
++    );
++  });
++
++  it.effect("lets a fetched Registry entry replace a bundled agent with the same id", () => {
++    const fetched = {
++      ...makeAgent({ npx: { package: "@example/acp@1.2.3" } }),
++      id: "omp",
++      name: "Oh My Pi",
++      version: "9.9.9",
++    } satisfies AcpRegistryAgent;
++    return Effect.gen(function* () {
++      const fileSystem = yield* FileSystem.FileSystem;
++      const cacheDir = yield* fileSystem.makeTempDirectoryScoped({
++        prefix: "t3-acp-registry-bundled-precedence-",
++      });
++      const resolver = yield* makeAcpRegistryCatalog({
++        cacheDir,
++        toolsDir: `${cacheDir}/tools`,
++        registryUrl,
++      });
++      const result = yield* resolver.search({ query: "omp" });
++
++      expect(result.agents).toHaveLength(1);
++      expect(result.agents[0]).toMatchObject({ id: "omp", version: "9.9.9" });
++    }).pipe(
++      Effect.scoped,
++      Effect.provide(
++        resolverLayer((request) =>
++          Effect.succeed(HttpClientResponse.fromWeb(request, new Response(makeRegistry(fetched)))),
++        ),
++      ),
++    );
++  });
++
++  it.effect("filters the bundled Oh My Pi entry when its runner is unavailable", () => {
++    return Effect.gen(function* () {
++      const fileSystem = yield* FileSystem.FileSystem;
++      const cacheDir = yield* fileSystem.makeTempDirectoryScoped({
++        prefix: "t3-acp-registry-bundled-filter-",
++      });
++      const resolver = yield* makeAcpRegistryCatalog({
++        cacheDir,
++        toolsDir: `${cacheDir}/tools`,
++        registryUrl,
++      });
++      const result = yield* resolver.search({ query: "omp" });
++
++      expect(result.agents).toEqual([]);
++    }).pipe(
++      Effect.scoped,
++      Effect.provide(
++        resolverLayer(
++          (request) =>
++            Effect.succeed(
++              HttpClientResponse.fromWeb(
++                request,
++                new Response(JSON.stringify({ version: "1.0.0", agents: [] })),
++              ),
++            ),
++          { PATH: "" },
++        ),
++      ),
++    );
++  });
++
+   it.effect("ignores unpinned runner recipes from the registry", () => {
+     const agent = makeAgent({ npx: { package: "@example/acp@latest" } });
+     return Effect.gen(function* () {
+@@ -870,7 +970,8 @@ describe("AcpRegistrySupport", () => {
+       });
+       const result = yield* resolver.search({ query: "" });
+ 
+-      expect(result.agents).toEqual([]);
++      // The unpinned fetched recipe is dropped; the bundled npx agent remains.
++      expect(result.agents.map((agent) => agent.id)).toEqual(["omp"]);
+     }).pipe(
+       Effect.scoped,
+       Effect.provide(
+diff --git a/apps/server/src/provider/acp/AcpRegistrySupport.ts b/apps/server/src/provider/acp/AcpRegistrySupport.ts
+index 21c34e6dc..3ca946897 100644
+--- a/apps/server/src/provider/acp/AcpRegistrySupport.ts
++++ b/apps/server/src/provider/acp/AcpRegistrySupport.ts
+@@ -40,6 +40,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+ import * as NodeCrypto from "node:crypto";
+ 
+ import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
++import { bundledAcpRegistryAgents } from "./bundledAcpAgents.ts";
+ import type { AcpSpawnInput } from "./AcpSessionRuntime.ts";
+ 
+ const ACP_REGISTRY_URL = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
+@@ -709,11 +710,25 @@ export const makeAcpRegistryCatalog = Effect.fn("AcpRegistryCatalog.make")(funct
+           }),
+       ),
+     );
+-    const agents = envelope.agents.flatMap((candidate) => {
++    const decodeCandidate = (candidate: unknown) => {
+       const decodedAgent = decodeRegistryAgent(candidate);
+       return Option.isSome(decodedAgent) ? [decodedAgent.value] : [];
++    };
++    // Bundled entries validate like fetched ones and merge behind them: the
++    // first occurrence of an id wins, so an official Registry listing
++    // supersedes its bundled stopgap once it exists.
++    const decodedAgents = [
++      ...envelope.agents.flatMap(decodeCandidate),
++      ...bundledAcpRegistryAgents.flatMap(decodeCandidate),
++    ];
++    const agentIds = new Set<string>();
++    const agents = decodedAgents.filter((agent) => {
++      if (agentIds.has(agent.id)) return false;
++      agentIds.add(agent.id);
++      return true;
+     });
+-    const discarded = envelope.agents.length - agents.length;
++    const discarded =
++      envelope.agents.length + bundledAcpRegistryAgents.length - decodedAgents.length;
+     if (discarded > 0) {
+       yield* Effect.logWarning("ignored invalid ACP Registry entries", { discarded });
+     }
+diff --git a/apps/server/src/provider/acp/bundledAcpAgents.ts b/apps/server/src/provider/acp/bundledAcpAgents.ts
+new file mode 100644
+index 000000000..d6f6e71a8
+--- /dev/null
++++ b/apps/server/src/provider/acp/bundledAcpAgents.ts
+@@ -0,0 +1,25 @@
++/**
++ * ACP agents T3 Code ships locally so they are installable before their entry
++ * lands in the official ACP Registry. These entries are validated exactly like
++ * fetched Registry entries and merged behind them: the first entry with a given
++ * id wins, so an official Registry listing supersedes its bundled copy as soon
++ * as it appears. Keep this list to agents missing from the Registry and pin
++ * exact package versions.
++ */
++export const bundledAcpRegistryAgents = [
++  {
++    id: "omp",
++    name: "Oh My Pi",
++    version: "18.2.3",
++    description: "Coding agent CLI with read, bash, edit, write tools and session management",
++    authors: ["can1357"],
++    license: "MIT",
++    repository: "https://github.com/can1357/oh-my-pi",
++    distribution: {
++      npx: {
++        package: "@oh-my-pi/pi-coding-agent@18.2.3",
++        args: ["acp"],
++      },
++    },
++  },
++] as const;
+diff --git a/docs/user/providers-acp.md b/docs/user/providers-acp.md
+index cd3927b83..9c5c5188f 100644
+--- a/docs/user/providers-acp.md
++++ b/docs/user/providers-acp.md
+@@ -8,6 +8,9 @@ delegation.
+ Google Antigravity is available through its official `antigravity-acp` Registry entry. Add it like
+ any other Registry agent; it does not need an Antigravity-specific T3 Code provider.
+ 
++Oh My Pi appears in Registry search even before the official Registry lists it: T3 Code bundles its
++entry, and the official listing takes over automatically once it is published.
++
+ T3 Code prefers the current ACP v2 preview protocol and uses its richer messages, usage, plans,
+ configuration, compaction, and agent-terminal updates when the agent supports them. It also
+ negotiates ACP v1 for Registry agents that have not migrated yet, so agents such as Pi continue to

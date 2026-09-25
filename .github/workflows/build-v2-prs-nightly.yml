@@ -1,0 +1,39 @@
+name: Build T3 Code v2 orchestrator nightly with Command Code and Oh My Pi (Windows)
+
+# Builds the v2 orchestrator branch head with the local v2-prs patches: the
+# Command Code provider ported to orchestrationAdapter, and the bundled
+# Oh My Pi ACP Registry entry.
+
+on:
+  schedule:
+    - cron: "33 * * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if this orchestrator revision and patches were already recorded
+        required: false
+        default: false
+        type: boolean
+      pr_refs:
+        description: Space separated upstream pull request refs; the first ref is the pinned source
+        required: false
+        default: refs/pull/2829/head
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: t3code-v2-prs-windows-nightly
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-layered-windows.yml
+    with:
+      flavor: v2-prs
+      source_mode: pin
+      test_kind: v2-command-code
+      pr_refs: ${{ inputs.pr_refs || 'refs/pull/2829/head' }}
+      force: ${{ inputs.force || false }}
+    secrets: inherit

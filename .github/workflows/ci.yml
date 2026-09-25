@@ -1,0 +1,17 @@
+name: Packaging CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate packaging files and shell scripts
+        run: bash scripts/validate-packaging.sh
