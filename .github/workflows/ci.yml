@@ -13,5 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Mark packaging scripts executable
+        run: chmod +x scripts/*.sh
       - name: Validate packaging files and shell scripts
         run: bash scripts/validate-packaging.sh

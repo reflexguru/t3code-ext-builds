@@ -76,7 +76,7 @@ if ! command -v git >/dev/null 2>&1; then
   exit 1
 fi
 
-./scripts/resolve-build.sh >/dev/null
+bash scripts/resolve-build.sh >/dev/null
 # shellcheck disable=SC1091
 source .work/resolve.env
 export TAG SHA VERSION PR_SPEC
@@ -86,13 +86,13 @@ if [[ "$should_build" != "true" ]]; then
   exit 0
 fi
 
-./scripts/prepare-t3code.sh
+bash scripts/prepare-t3code.sh
 if [[ "$SOURCE_MODE" == "merge" ]]; then
-  ./scripts/layer-pull-requests.sh
+  bash scripts/layer-pull-requests.sh
 else
-  ./scripts/confirm-pinned-source.sh
+  bash scripts/confirm-pinned-source.sh
 fi
-./scripts/apply-patches.sh
+bash scripts/apply-patches.sh
 
 if [[ "$skip_package" == "true" ]]; then
   echo "Prepared ${T3CODE_SRC} (${flavor} ${version}). Skipping the installer."
@@ -130,7 +130,7 @@ run_vp install \
   --filter=@t3tools/scripts...
 
 if [[ "$skip_tests" != "true" ]]; then
-  "$repo_root/scripts/test-command-code.sh"
+  bash "$repo_root/scripts/test-command-code.sh"
 fi
 
 node scripts/update-release-package-versions.ts "$version"
@@ -144,9 +144,9 @@ run_vp run dist:desktop:artifact \
   --verbose
 
 dest="${repo_root}/release/${flavor}/${version}"
-"$repo_root/scripts/collect-windows-artifacts.sh" "${T3CODE_SRC}/release" "$dest"
-"$repo_root/scripts/write-provenance.sh" "${dest}/upstream-prs.txt"
-"$repo_root/scripts/record-last-built-key.sh" "$flavor" "$key"
+bash "$repo_root/scripts/collect-windows-artifacts.sh" "${T3CODE_SRC}/release" "$dest"
+bash "$repo_root/scripts/write-provenance.sh" "${dest}/upstream-prs.txt"
+bash "$repo_root/scripts/record-last-built-key.sh" "$flavor" "$key"
 
 echo
 echo "Windows ${flavor} build is in ${dest}"

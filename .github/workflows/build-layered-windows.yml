@@ -50,6 +50,8 @@ jobs:
         with:
           ref: ${{ github.ref }}
           fetch-depth: 0
+      - name: Mark packaging scripts executable
+        run: chmod +x scripts/*.sh
       - name: Resolve versions
         id: release
         env:
@@ -88,6 +90,9 @@ jobs:
 
       - name: Checkout this packaging repository
         uses: actions/checkout@v5
+
+      - name: Mark packaging scripts executable
+        run: chmod +x scripts/*.sh
 
       - name: Checkout upstream T3 Code
         uses: actions/checkout@v5
@@ -204,6 +209,8 @@ jobs:
         with:
           ref: ${{ github.ref }}
           fetch-depth: 0
+      - name: Mark packaging scripts executable
+        run: chmod +x scripts/*.sh
       - uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.flavor }}-windows-x64

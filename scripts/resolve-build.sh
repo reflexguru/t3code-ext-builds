@@ -80,7 +80,7 @@ sha=""
 key=""
 
 if [[ "$source_mode" == "merge" ]]; then
-  tag="$(./scripts/resolve-latest-nightly.sh)"
+  tag="$(bash scripts/resolve-latest-nightly.sh)"
   version="${tag#v}"
   sha="$(gh api "repos/${t3code_repo}/git/ref/tags/${tag}" --jq '.object.sha' 2>/dev/null || true)"
   if [[ -z "$sha" || "$sha" == "null" ]]; then
@@ -90,7 +90,7 @@ if [[ "$source_mode" == "merge" ]]; then
   echo "Resolved upstream nightly: ${tag}" >&2
 else
   sha="$first_sha"
-  base="$(./scripts/resolve-latest-nightly.sh)"
+  base="$(bash scripts/resolve-latest-nightly.sh)"
   base_version="${base#v}"
   base_version="${base_version%%-nightly.*}"
   test -n "$base_version" || {
