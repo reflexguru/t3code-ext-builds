@@ -36,7 +36,10 @@ case "$kind" in
       echo "Pull request 10861 is not layered; skipping the Command Code adapter test."
       exit 0
     fi
-    run_vp test run src/provider/Layers/CommandCodeAdapter.test.ts
+    run_vp test run \
+      src/provider/Layers/CommandCodeAdapter.test.ts \
+      src/provider/commandCodeModels.test.ts \
+      src/provider/commandCodeLaunchArgs.test.ts
     ;;
   v2-command-code|v2-command-code-optional)
     tests=(

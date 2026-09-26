@@ -1,0 +1,344 @@
+Command Code: surface model reasoning effort like the other providers.
+
+Upstream PR #10861 lists models with `capabilities: null`, so the composer
+hides the Reasoning control that Codex, Claude, and Grok show. Command Code
+already accepts `--effort` (`low`, `medium`, `high`, `xhigh`, `max`). The
+adapter now advertises that select on every model and passes the chosen
+level through to the CLI.
+
+diff --git a/apps/server/src/provider/Layers/CommandCodeAdapter.test.ts b/apps/server/src/provider/Layers/CommandCodeAdapter.test.ts
+index 0393a93..ec0d6f8 100644
+--- a/apps/server/src/provider/Layers/CommandCodeAdapter.test.ts
++++ b/apps/server/src/provider/Layers/CommandCodeAdapter.test.ts
+@@ -98,7 +98,11 @@ describe("CommandCodeAdapter (mock CLI)", () => {
+           const first = yield* adapter.sendTurn({
+             threadId,
+             input: "hola",
+-            modelSelection: { instanceId, model: "deepseek/deepseek-v4-flash" },
++            modelSelection: {
++              instanceId,
++              model: "deepseek/deepseek-v4-flash",
++              options: [{ id: "effort", value: "high" }],
++            },
+           });
+           const events = yield* Fiber.join(eventsFiber);
+ 
+@@ -117,6 +121,8 @@ describe("CommandCodeAdapter (mock CLI)", () => {
+           expect(firstArgv.argv).toContain("--yolo");
+           expect(firstArgv.argv).toContain("--model");
+           expect(firstArgv.argv).toContain("deepseek/deepseek-v4-flash");
++          expect(firstArgv.argv).toContain("--effort");
++          expect(firstArgv.argv).toContain("high");
+ 
+           // A second turn resumes the same Command Code session.
+           const second = yield* adapter.sendTurn({
+diff --git a/apps/server/src/provider/Layers/CommandCodeAdapter.ts b/apps/server/src/provider/Layers/CommandCodeAdapter.ts
+index dd43848..bc1653d 100644
+--- a/apps/server/src/provider/Layers/CommandCodeAdapter.ts
++++ b/apps/server/src/provider/Layers/CommandCodeAdapter.ts
+@@ -46,6 +46,7 @@ import * as Scope from "effect/Scope";
+ import * as Stream from "effect/Stream";
+ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+ import { resolveSpawnCommand } from "@t3tools/shared/shell";
++import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
+ 
+ import {
+   ProviderAdapterProcessError,
+@@ -55,6 +56,7 @@ import {
+ } from "../Errors.ts";
+ import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+ import { commandCodeTurnArgs } from "../commandCodeLaunchArgs.ts";
++import { normalizeCommandCodeEffort } from "../commandCodeModels.ts";
+ 
+ const ANSI_ESCAPE_REGEX = /\u001b\[[0-9;]*m/g;
+ 
+@@ -175,6 +177,15 @@ function toThreadUsageSnapshot(usage: UsageTotals): ThreadTokenUsageSnapshot {
+   };
+ }
+ 
++function effortFromModelSelection(modelSelection: ProviderSendTurnInput["modelSelection"]) {
++  return (
++    normalizeCommandCodeEffort(getModelSelectionStringOptionValue(modelSelection, "effort")) ??
++    normalizeCommandCodeEffort(
++      getModelSelectionStringOptionValue(modelSelection, "reasoningEffort"),
++    )
++  );
++}
++
+ function asToolRecord(value: unknown): Record<string, unknown> | null {
+   return value !== null && typeof value === "object" && !Array.isArray(value)
+     ? (value as Record<string, unknown>)
+@@ -367,6 +378,7 @@ interface ActiveRun {
+ interface QueuedPrompt {
+   readonly text: string;
+   readonly model: string | undefined;
++  readonly effort: string | undefined;
+ }
+ 
+ /** Structural view of the spawner's child handle, kept wide so the adapter
+@@ -657,6 +669,7 @@ export function makeCommandCodeAdapter(
+       readonly turnId: TurnId;
+       readonly prompt: string;
+       readonly model: string | undefined;
++      readonly effort: string | undefined;
+     }) =>
+       Effect.gen(function* () {
+         const session = yield* getSession(input.threadId);
+@@ -672,6 +685,7 @@ export function makeCommandCodeAdapter(
+         const args = commandCodeTurnArgs({
+           permissionMode: config.permissionMode,
+           model: input.model,
++          effort: input.effort,
+           resumeSessionId: session.commandCodeSessionId,
+           launchArgs: config.launchArgs,
+         });
+@@ -1127,6 +1141,7 @@ export function makeCommandCodeAdapter(
+       readonly turnId: TurnId;
+       readonly prompt: string;
+       readonly model: string | undefined;
++      readonly effort: string | undefined;
+     }) =>
+       Effect.gen(function* () {
+         // Retiring the run (a session restart) between admission and here must
+@@ -1147,7 +1162,11 @@ export function makeCommandCodeAdapter(
+           payload: input.model === undefined ? {} : { model: input.model },
+         });
+ 
+-        let prompt: QueuedPrompt = { text: input.prompt, model: input.model };
++        let prompt: QueuedPrompt = {
++          text: input.prompt,
++          model: input.model,
++          effort: input.effort,
++        };
+         let usage: UsageTotals | undefined;
+         for (;;) {
+           const result: SinglePromptResult = yield* runSinglePrompt({
+@@ -1155,6 +1174,7 @@ export function makeCommandCodeAdapter(
+             turnId: input.turnId,
+             prompt: prompt.text,
+             model: prompt.model,
++            effort: prompt.effort,
+           });
+           usage = result.usage ?? usage;
+           if (result.outcome !== "completed") {
+@@ -1194,6 +1214,7 @@ export function makeCommandCodeAdapter(
+       readonly turnId: TurnId;
+       readonly prompt: string;
+       readonly model: string | undefined;
++      readonly effort: string | undefined;
+     }): Effect.Effect<TurnOutcome, ProviderAdapterProcessError> =>
+       runTurnRaw(input).pipe(
+         Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+@@ -1272,11 +1293,12 @@ export function makeCommandCodeAdapter(
+             });
+           }
+           const model = input.modelSelection?.model ?? session.model;
++          const effort = effortFromModelSelection(input.modelSelection);
+           const candidateTurnId = (yield* nextId()) as TurnId;
+           const admission = yield* admitTurn({
+             threadId: input.threadId,
+             turnId: candidateTurnId,
+-            prompt: { text: promptText, model },
++            prompt: { text: promptText, model, effort },
+           });
+           if (admission === "missing") {
+             return yield* new ProviderAdapterSessionNotFoundError({
+@@ -1305,6 +1327,7 @@ export function makeCommandCodeAdapter(
+             turnId: candidateTurnId,
+             prompt: promptText,
+             model,
++            effort,
+           }).pipe(Effect.ensuring(releaseTurn(input.threadId, candidateTurnId)));
+           void outcome;
+           const updated = yield* getSession(input.threadId);
+diff --git a/apps/server/src/provider/commandCodeLaunchArgs.test.ts b/apps/server/src/provider/commandCodeLaunchArgs.test.ts
+new file mode 100644
+index 0000000..c1c03ac
+--- /dev/null
++++ b/apps/server/src/provider/commandCodeLaunchArgs.test.ts
+@@ -0,0 +1,41 @@
++import { describe, expect, it } from "vite-plus/test";
++
++import { commandCodeTurnArgs } from "./commandCodeLaunchArgs.ts";
++
++describe("commandCodeTurnArgs", () => {
++  it("passes --effort after --model when the level is recognized", () => {
++    expect(
++      commandCodeTurnArgs({
++        permissionMode: "auto-accept",
++        model: "claude-sonnet-5",
++        effort: "xhigh",
++      }),
++    ).toEqual([
++      "-p",
++      "--output-format",
++      "json",
++      "--skip-onboarding",
++      "--yolo",
++      "--model",
++      "claude-sonnet-5",
++      "--effort",
++      "xhigh",
++    ]);
++  });
++
++  it("omits --effort for blank or unknown levels", () => {
++    expect(
++      commandCodeTurnArgs({
++        permissionMode: "standard",
++        model: "claude-sonnet-5",
++        effort: "turbo",
++      }),
++    ).not.toContain("--effort");
++    expect(
++      commandCodeTurnArgs({
++        permissionMode: "standard",
++        model: "claude-sonnet-5",
++      }),
++    ).not.toContain("--effort");
++  });
++});
+diff --git a/apps/server/src/provider/commandCodeLaunchArgs.ts b/apps/server/src/provider/commandCodeLaunchArgs.ts
+index ad7d47a..85652aa 100644
+--- a/apps/server/src/provider/commandCodeLaunchArgs.ts
++++ b/apps/server/src/provider/commandCodeLaunchArgs.ts
+@@ -11,6 +11,8 @@
+ import type { CommandCodePermissionMode } from "@t3tools/contracts";
+ import { tokenizeCliArgs } from "@t3tools/shared/cliArgs";
+ 
++import { normalizeCommandCodeEffort } from "./commandCodeModels.ts";
++
+ export const COMMAND_CODE_VERSION_ARGS = ["--version"] as const;
+ export const COMMAND_CODE_LIST_MODELS_ARGS = ["--list-models"] as const;
+ 
+@@ -18,6 +20,8 @@ export interface CommandCodeTurnArgsInput {
+   readonly permissionMode: CommandCodePermissionMode;
+   /** Model slug. Omitted when blank so the CLI uses its own persisted default. */
+   readonly model?: string | undefined;
++  /** Reasoning effort for `--effort`. Omitted when unset or unrecognized. */
++  readonly effort?: string | undefined;
+   /** Command Code headless session id, used to carry context between turns. */
+   readonly resumeSessionId?: string | undefined;
+   /** Extra user-provided CLI arguments, tokenized. */
+@@ -37,6 +41,10 @@ export function commandCodeTurnArgs(input: CommandCodeTurnArgsInput): ReadonlyAr
+   if (input.model !== undefined && input.model.trim().length > 0) {
+     args.push("--model", input.model.trim());
+   }
++  const effort = normalizeCommandCodeEffort(input.effort);
++  if (effort !== undefined) {
++    args.push("--effort", effort);
++  }
+   if (input.resumeSessionId !== undefined && input.resumeSessionId.trim().length > 0) {
+     args.push("--resume", input.resumeSessionId.trim());
+   }
+diff --git a/apps/server/src/provider/commandCodeModels.test.ts b/apps/server/src/provider/commandCodeModels.test.ts
+index 18d286a..81c1a78 100644
+--- a/apps/server/src/provider/commandCodeModels.test.ts
++++ b/apps/server/src/provider/commandCodeModels.test.ts
+@@ -1,6 +1,10 @@
+ import { describe, expect, it } from "vite-plus/test";
+ 
+-import { parseCommandCodeModelList } from "./commandCodeModels.ts";
++import {
++  parseCommandCodeModelList,
++  COMMAND_CODE_MODEL_CAPABILITIES,
++  normalizeCommandCodeEffort,
++} from "./commandCodeModels.ts";
+ 
+ const SAMPLE_LIST = `Available models  ·  3 models
+ 
+@@ -22,9 +26,13 @@ describe("parseCommandCodeModelList", () => {
+       "z-ai/glm-5.3-flash",
+       "claude-sonnet-5",
+     ]);
+-    expect(models.every((model) => model.isCustom === false && model.capabilities === null)).toBe(
+-      true,
+-    );
++    expect(
++      models.every(
++        (model) =>
++          model.isCustom === false && model.capabilities === COMMAND_CODE_MODEL_CAPABILITIES,
++      ),
++    ).toBe(true);
++    expect(COMMAND_CODE_MODEL_CAPABILITIES.optionDescriptors?.[0]?.id).toBe("effort");
+   });
+ 
+   it("marks the explicitly-default row, not the first row", () => {
+@@ -56,4 +64,10 @@ describe("parseCommandCodeModelList", () => {
+     expect(parseCommandCodeModelList("")).toEqual([]);
+     expect(parseCommandCodeModelList("Anthropic\n\nOpen Source\n")).toEqual([]);
+   });
++
++  it("normalizes CLI effort tokens and rejects unknown values", () => {
++    expect(normalizeCommandCodeEffort(" High ")).toBe("high");
++    expect(normalizeCommandCodeEffort("xhigh")).toBe("xhigh");
++    expect(normalizeCommandCodeEffort("turbo")).toBeUndefined();
++  });
+ });
+diff --git a/apps/server/src/provider/commandCodeModels.ts b/apps/server/src/provider/commandCodeModels.ts
+index 0664dd3..15c7d47 100644
+--- a/apps/server/src/provider/commandCodeModels.ts
++++ b/apps/server/src/provider/commandCodeModels.ts
+@@ -19,7 +19,8 @@
+  *
+  * @module provider/commandCodeModels
+  */
+-import type { ServerProviderModel } from "@t3tools/contracts";
++import type { ModelCapabilities, ServerProviderModel } from "@t3tools/contracts";
++import { createModelCapabilities } from "@t3tools/shared/model";
+ 
+ const ANSI_ESCAPE_REGEX = /\u001b\[[0-9;]*m/g;
+ 
+@@ -41,6 +42,43 @@ function isCategoryHeader(slug: string, note: string | undefined): boolean {
+   return /^[A-Z]/.test(slug) && !slug.includes("/") && !slug.includes(":");
+ }
+ 
++/** CLI `--effort` / `/effort` levels advertised in Command Code settings. */
++export const COMMAND_CODE_EFFORT_VALUES = ["low", "medium", "high", "xhigh", "max"] as const;
++export type CommandCodeEffort = (typeof COMMAND_CODE_EFFORT_VALUES)[number];
++
++/**
++ * Reasoning control shown on every Command Code model. The CLI accepts these
++ * values on `--effort`; the picker is advertised for all models so T3 matches
++ * other providers instead of hiding the control.
++ */
++export const COMMAND_CODE_MODEL_CAPABILITIES: ModelCapabilities = createModelCapabilities({
++  optionDescriptors: [
++    {
++      id: "effort",
++      label: "Reasoning",
++      type: "select",
++      currentValue: "high",
++      options: [
++        { id: "low", label: "Low" },
++        { id: "medium", label: "Medium" },
++        { id: "high", label: "High", isDefault: true },
++        { id: "xhigh", label: "Extra High" },
++        { id: "max", label: "Max" },
++      ],
++    },
++  ],
++});
++
++export function normalizeCommandCodeEffort(
++  value: string | undefined,
++): CommandCodeEffort | undefined {
++  if (value === undefined) return undefined;
++  const trimmed = value.trim().toLowerCase();
++  return (COMMAND_CODE_EFFORT_VALUES as readonly string[]).includes(trimmed)
++    ? (trimmed as CommandCodeEffort)
++    : undefined;
++}
++
+ export function parseCommandCodeModelList(output: string): ReadonlyArray<ServerProviderModel> {
+   const rows: Array<{ readonly slug: string; readonly note: string | undefined }> = [];
+   const seen = new Set<string>();
+@@ -73,7 +111,7 @@ export function parseCommandCodeModelList(output: string): ReadonlyArray<ServerP
+       // capability prose, and the picker searches both fields anyway.
+       name: row.slug,
+       isCustom: false,
+-      capabilities: null,
++      capabilities: COMMAND_CODE_MODEL_CAPABILITIES,
+       ...(isDefault ? { isDefault: true } : {}),
+     };
+   });
