@@ -101,6 +101,7 @@ the conflicted files, then record both sides' hashes and the resolved files here
 | Resolution | Why |
 | --- | --- |
 | `resolutions/11973/apps/desktop/scripts/ensure-electron-runtime.mjs` | PR #11973 adds the Windows extraction branch next to the line the nightly changed. The resolution keeps the nightly's `distDir` variable and the pull request's branch. |
+| `resolutions/11973/apps/server/src/provider/acp/AcpSessionRuntime.ts` | After Command Code (#10861) is layered, nightly and #11973 both touch the ACP session runtime (omp `/fresh` session switching vs the current prompt/cancel path). The recorded file is the merge from [t3code-copr](https://github.com/slopfire/t3code-copr), keeping both sides. |
 
 A flavor reads only the resolutions of the pull requests it layers, so neither
 v2 flavor needs any: they build the orchestrator branch head directly instead of
