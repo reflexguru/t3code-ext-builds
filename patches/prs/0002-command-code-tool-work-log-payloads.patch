@@ -1,0 +1,436 @@
+Command Code: keep tool names, paths, and commands on work-log rows.
+
+Upstream PR #10861 emits `title` only on `item.started`. Completed, failed,
+and declined tool events carry just `{ itemType, status }`, so ingestion
+labels the settled row `Tool` and the client cannot recover the path or
+command. Completed frames also omit `input`, and `extractToolCallId` reads
+`payload.data.toolCallId`, which this adapter never set.
+
+Remember each tool's args from `tool_queued`, humanize the title, keep the
+path/command as `detail`, and put `data.toolCallId` plus structured `item`
+fields on every lifecycle event so started and completed rows collapse and
+render like the other providers.
+
+diff --git a/apps/server/src/provider/Layers/CommandCodeAdapter.test.ts b/apps/server/src/provider/Layers/CommandCodeAdapter.test.ts
+index 07f8696..0393a93 100644
+--- a/apps/server/src/provider/Layers/CommandCodeAdapter.test.ts
++++ b/apps/server/src/provider/Layers/CommandCodeAdapter.test.ts
+@@ -262,6 +262,72 @@ describe("CommandCodeAdapter (mock CLI)", () => {
+     }
+   }, 30_000);
+ 
++  it("keeps tool names, paths, and commands on completed work-log items", async () => {
++    const harness = prepareMockHarness();
++    try {
++      await runScoped(
++        Effect.gen(function* () {
++          const instanceId = ProviderInstanceId.make("commandCodeTest");
++          const threadId = ThreadId.make("thread-tools");
++          const adapter = yield* makeCommandCodeAdapter(makeConfig(harness.binaryPath), {
++            driverKind: ProviderDriverKind.make("commandCode"),
++            instanceId,
++            environment: {
++              ...process.env,
++              T3_MOCK_ARGV_LOG: harness.argvLogPath,
++              T3_MOCK_TOOLS: "1",
++            },
++          });
++          yield* adapter.startSession({ threadId, cwd: harness.cwd, runtimeMode: "full-access" });
++
++          const eventsFiber = yield* Effect.forkScoped(
++            Stream.runCollect(
++              adapter.streamEvents.pipe(
++                Stream.takeUntil((event) => event.type === "turn.completed"),
++              ),
++            ),
++          );
++          yield* Effect.yieldNow;
++          yield* Effect.yieldNow;
++          yield* adapter.sendTurn({ threadId, input: "hola" });
++          const events = Array.from(yield* Fiber.join(eventsFiber));
++
++          const started = events.filter((event) => event.type === "item.started");
++          const completed = events.filter((event) => event.type === "item.completed");
++          const readStarted = started.find(
++            (event) => event.type === "item.started" && event.payload.title === "Read File",
++          );
++          const readCompleted = completed.find(
++            (event) => event.type === "item.completed" && event.payload.title === "Read File",
++          );
++          const shellCompleted = completed.find(
++            (event) => event.type === "item.completed" && event.payload.title === "Ran command",
++          );
++
++          expect(readStarted?.payload.detail).toBe("src/app.ts");
++          expect(readStarted?.payload.data).toMatchObject({
++            toolCallId: "call_read_1",
++            toolName: "read_file",
++          });
++          expect(readCompleted?.payload.itemType).toBe("dynamic_tool_call");
++          expect(readCompleted?.payload.detail).toBe("src/app.ts");
++          expect(readCompleted?.payload.data).toMatchObject({
++            toolCallId: "call_read_1",
++            item: { path: "src/app.ts", filePath: "src/app.ts" },
++          });
++          expect(shellCompleted?.payload.itemType).toBe("command_execution");
++          expect(shellCompleted?.payload.detail).toBe("echo probe");
++          expect(shellCompleted?.payload.data).toMatchObject({
++            toolCallId: "call_shell_1",
++            item: { command: "echo probe" },
++          });
++        }),
++      );
++    } finally {
++      harness.cleanup();
++    }
++  }, 30_000);
++
+   it("interrupts an in-flight turn and emits turn.aborted", async () => {
+     const harness = prepareMockHarness();
+     try {
+diff --git a/apps/server/src/provider/Layers/CommandCodeAdapter.ts b/apps/server/src/provider/Layers/CommandCodeAdapter.ts
+index 1ac201b..dd43848 100644
+--- a/apps/server/src/provider/Layers/CommandCodeAdapter.ts
++++ b/apps/server/src/provider/Layers/CommandCodeAdapter.ts
+@@ -175,20 +175,84 @@ function toThreadUsageSnapshot(usage: UsageTotals): ThreadTokenUsageSnapshot {
+   };
+ }
+ 
++function asToolRecord(value: unknown): Record<string, unknown> | null {
++  return value !== null && typeof value === "object" && !Array.isArray(value)
++    ? (value as Record<string, unknown>)
++    : null;
++}
++
++function firstToolString(
++  record: Record<string, unknown>,
++  keys: ReadonlyArray<string>,
++): string | undefined {
++  for (const key of keys) {
++    const value = record[key];
++    if (typeof value === "string" && value.trim().length > 0) {
++      return value.trim();
++    }
++  }
++  return undefined;
++}
++
+ function summarizeToolInput(input: unknown): string | undefined {
+   if (typeof input === "string") {
+     const trimmed = input.trim();
+     return trimmed.length > 0 ? trimmed.slice(0, 240) : undefined;
+   }
+-  if (input === null || typeof input !== "object") return undefined;
+-  const record = input as Record<string, unknown>;
+-  const filePath = typeof record["file_path"] === "string" ? record["file_path"] : undefined;
+-  const command = typeof record["command"] === "string" ? record["command"] : undefined;
+-  const value = filePath ?? command;
+-  if (typeof value === "string" && value.trim().length > 0) {
+-    return value.trim().slice(0, 240);
++  const record = asToolRecord(input);
++  if (record === null) return undefined;
++  const value = firstToolString(record, [
++    "file_path",
++    "path",
++    "command",
++    "query",
++    "pattern",
++    "glob",
++    "url",
++    "target",
++  ]);
++  return value !== undefined ? value.slice(0, 240) : undefined;
++}
++
++function summarizeToolResult(result: unknown): string | undefined {
++  if (typeof result === "string") {
++    const trimmed = result.trim();
++    return trimmed.length > 0 ? trimmed.slice(0, 240) : undefined;
+   }
+-  return undefined;
++  if (!Array.isArray(result)) return undefined;
++  const texts = result.flatMap((entry) => {
++    if (typeof entry === "string" && entry.trim().length > 0) return [entry.trim()];
++    const record = asToolRecord(entry);
++    if (record !== null && record["type"] === "text" && typeof record["text"] === "string") {
++      const text = record["text"].trim();
++      return text.length > 0 ? [text] : [];
++    }
++    return [];
++  });
++  return texts.length > 0 ? texts.join("\n").slice(0, 240) : undefined;
++}
++
++const TOOL_DISPLAY_NAMES: Readonly<Record<string, string>> = {
++  read_file: "Read File",
++  write_file: "Write File",
++  edit_file: "Edit File",
++  apply_patch: "Apply Patch",
++  multi_edit: "Edit Files",
++  shell_command: "Ran command",
++  bash: "Ran command",
++  powershell: "Ran command",
++  web_search: "Web Search",
++  web_fetch: "Web Fetch",
++  grep: "Grep",
++  glob: "Glob",
++};
++
++function humanizeToolName(toolName: string): string {
++  const known = TOOL_DISPLAY_NAMES[toolName];
++  if (known !== undefined) return known;
++  const spaced = toolName.replaceAll("_", " ").trim();
++  if (spaced.length === 0) return "Tool";
++  return spaced.replace(/\b\w/g, (char) => char.toUpperCase());
+ }
+ 
+ function itemTypeForTool(toolName: string): string {
+@@ -203,12 +267,62 @@ function itemTypeForTool(toolName: string): string {
+   ) {
+     return "file_change";
+   }
+-  if (toolName === "web_search" || toolName === "web_fetch") {
++  if (toolName === "web_search" || toolName === "web_fetch" || toolName === "grep") {
+     return "web_search";
+   }
+   return "dynamic_tool_call";
+ }
+ 
++function toolItemData(input: {
++  readonly toolCallId: string;
++  readonly toolName: string;
++  readonly input: unknown;
++  readonly result?: unknown;
++}): Record<string, unknown> {
++  const record = asToolRecord(input.input);
++  const item: Record<string, unknown> = {};
++  const command = record !== null ? firstToolString(record, ["command"]) : undefined;
++  const filePath = record !== null ? firstToolString(record, ["file_path", "path"]) : undefined;
++  if (command !== undefined) item.command = command;
++  if (filePath !== undefined) {
++    item.path = filePath;
++    item.filePath = filePath;
++  }
++  if (record !== null) item.input = record;
++  if (input.result !== undefined) item.result = input.result;
++  return {
++    toolCallId: input.toolCallId,
++    toolName: input.toolName,
++    ...(Object.keys(item).length > 0 ? { item } : {}),
++    ...(record !== null ? { input: record } : {}),
++  };
++}
++
++function toolLifecyclePayload(input: {
++  readonly toolCallId: string;
++  readonly toolName: string;
++  readonly status: "inProgress" | "completed" | "failed" | "declined";
++  readonly input: unknown;
++  readonly result?: unknown;
++  readonly extraDetail?: string;
++}): {
++  readonly itemType: string;
++  readonly status: "inProgress" | "completed" | "failed" | "declined";
++  readonly title: string;
++  readonly data: Record<string, unknown>;
++  readonly detail?: string;
++} {
++  const detail =
++    input.extraDetail ?? summarizeToolInput(input.input) ?? summarizeToolResult(input.result);
++  return {
++    itemType: itemTypeForTool(input.toolName),
++    status: input.status,
++    title: humanizeToolName(input.toolName),
++    ...(detail !== undefined && detail.length > 0 ? { detail: detail.slice(0, 2_000) } : {}),
++    data: toolItemData(input),
++  };
++}
++
+ // ── Adapter factory ─────────────────────────────────────────────────
+ 
+ interface CommandCodeAdapterOptions {
+@@ -624,6 +738,25 @@ export function makeCommandCodeAdapter(
+         // text onto the previous turn's message.
+         const assistantItemPrefix = `assistant-${input.turnId}-`;
+         const reasoningItemPrefix = `reasoning-${input.turnId}-`;
++        // Completed/failed frames often omit `input`; keep the queued args so
++        // the work log can still show the path or command after the tool ends.
++        const rememberedToolCalls = new Map<
++          string,
++          { readonly toolName: string; readonly input: unknown }
++        >();
++        const rememberToolCall = (
++          toolCallId: string,
++          toolName: string,
++          input: unknown,
++        ): { readonly toolName: string; readonly input: unknown } => {
++          const existing = rememberedToolCalls.get(toolCallId);
++          const remembered = {
++            toolName: existing?.toolName ?? toolName,
++            input: input !== undefined ? input : existing?.input,
++          };
++          rememberedToolCalls.set(toolCallId, remembered);
++          return remembered;
++        };
+ 
+         const handleLine = (line: string): Effect.Effect<void> =>
+           Effect.gen(function* () {
+@@ -724,19 +857,18 @@ export function makeCommandCodeAdapter(
+                   typeof frame["toolCallId"] === "string" ? frame["toolCallId"] : undefined;
+                 const toolName = typeof frame["toolName"] === "string" ? frame["toolName"] : "tool";
+                 if (toolCallId === undefined) return;
+-                const itemId = `tool-${toolCallId}`;
+-                const detail = summarizeToolInput(frame["input"]);
++                const remembered = rememberToolCall(toolCallId, toolName, frame["input"]);
+                 yield* offer({
+                   type: "item.started",
+                   threadId: input.threadId,
+                   turnId: input.turnId,
+-                  itemId,
+-                  payload: {
+-                    itemType: itemTypeForTool(toolName),
++                  itemId: `tool-${toolCallId}`,
++                  payload: toolLifecyclePayload({
++                    toolCallId,
++                    toolName: remembered.toolName,
+                     status: "inProgress",
+-                    title: toolName,
+-                    ...(detail !== undefined ? { detail } : {}),
+-                  },
++                    input: remembered.input,
++                  }),
+                 });
+                 return;
+               }
+@@ -784,12 +916,19 @@ export function makeCommandCodeAdapter(
+                     ...(reason !== undefined ? { reason } : {}),
+                   },
+                 });
++                const remembered = rememberToolCall(toolCallId, toolName, frame["input"]);
+                 yield* offer({
+                   type: "item.completed",
+                   threadId: input.threadId,
+                   turnId: input.turnId,
+                   itemId: `tool-${toolCallId}`,
+-                  payload: { itemType: itemTypeForTool(toolName), status: "declined" },
++                  payload: toolLifecyclePayload({
++                    toolCallId,
++                    toolName: remembered.toolName,
++                    status: "declined",
++                    input: remembered.input,
++                    extraDetail: reason,
++                  }),
+                 });
+                 return;
+               }
+@@ -802,16 +941,19 @@ export function makeCommandCodeAdapter(
+                   typeof frame["error"] === "string" || typeof frame["errorMessage"] === "string"
+                     ? String(frame["error"] ?? frame["errorMessage"]).trim()
+                     : "";
++                const remembered = rememberToolCall(toolCallId, toolName, frame["input"]);
+                 yield* offer({
+                   type: "item.completed",
+                   threadId: input.threadId,
+                   turnId: input.turnId,
+                   itemId: `tool-${toolCallId}`,
+-                  payload: {
+-                    itemType: itemTypeForTool(toolName),
++                  payload: toolLifecyclePayload({
++                    toolCallId,
++                    toolName: remembered.toolName,
+                     status: "failed",
+-                    ...(rawError.length > 0 ? { detail: rawError.slice(0, 2_000) } : {}),
+-                  },
++                    input: remembered.input,
++                    extraDetail: rawError.length > 0 ? rawError.slice(0, 2_000) : undefined,
++                  }),
+                 });
+                 return;
+               }
+@@ -820,12 +962,19 @@ export function makeCommandCodeAdapter(
+                   typeof frame["toolCallId"] === "string" ? frame["toolCallId"] : undefined;
+                 const toolName = typeof frame["toolName"] === "string" ? frame["toolName"] : "tool";
+                 if (toolCallId === undefined) return;
++                const remembered = rememberToolCall(toolCallId, toolName, frame["input"]);
+                 yield* offer({
+                   type: "item.completed",
+                   threadId: input.threadId,
+                   turnId: input.turnId,
+                   itemId: `tool-${toolCallId}`,
+-                  payload: { itemType: itemTypeForTool(toolName), status: "completed" },
++                  payload: toolLifecyclePayload({
++                    toolCallId,
++                    toolName: remembered.toolName,
++                    status: "completed",
++                    input: remembered.input,
++                    result: frame["result"],
++                  }),
+                 });
+                 return;
+               }
+diff --git a/apps/server/src/provider/testFixtures/commandCodeHeadless/commandcode-mock-agent.cjs b/apps/server/src/provider/testFixtures/commandCodeHeadless/commandcode-mock-agent.cjs
+index d2bdf53..065d533 100644
+--- a/apps/server/src/provider/testFixtures/commandCodeHeadless/commandcode-mock-agent.cjs
++++ b/apps/server/src/provider/testFixtures/commandCodeHeadless/commandcode-mock-agent.cjs
+@@ -10,6 +10,8 @@
+  *   T3_MOCK_HANG=1    stop emitting after the first message chunk and hold
+  *                     the process open until killed (interrupt tests)
+  *   T3_MOCK_EXIT_CODE finish with this exit code (default 0), for failure tests
++ *   T3_MOCK_TOOLS=1   emit a read_file and shell_command lifecycle before the
++ *                     assistant message ends (work-log payload tests)
+  */
+ "use strict";
+ 
+@@ -18,6 +20,7 @@ const fs = require("node:fs");
+ const sessionId = process.env.T3_MOCK_SESSION || "mock-session-1";
+ const argvLogPath = process.env.T3_MOCK_ARGV_LOG;
+ const hang = process.env.T3_MOCK_HANG === "1";
++const emitTools = process.env.T3_MOCK_TOOLS === "1";
+ const exitCode = Number.parseInt(process.env.T3_MOCK_EXIT_CODE || "0", 10);
+ process.exitCode = Number.isNaN(exitCode) ? 0 : exitCode;
+ 
+@@ -56,6 +59,44 @@ process.stdin.on("end", () => {
+   }
+ 
+   emit({ type: "event", event: { type: "text_delta", delta: ", mundo" } });
++  if (emitTools) {
++    emit({
++      type: "event",
++      event: {
++        type: "tool_queued",
++        toolCallId: "call_read_1",
++        toolName: "read_file",
++        input: { file_path: "src/app.ts" },
++      },
++    });
++    emit({
++      type: "event",
++      event: {
++        type: "tool_completed",
++        toolCallId: "call_read_1",
++        toolName: "read_file",
++        result: [{ type: "text", text: "export const app = 1;" }],
++      },
++    });
++    emit({
++      type: "event",
++      event: {
++        type: "tool_queued",
++        toolCallId: "call_shell_1",
++        toolName: "shell_command",
++        input: { command: "echo probe" },
++      },
++    });
++    emit({
++      type: "event",
++      event: {
++        type: "tool_completed",
++        toolCallId: "call_shell_1",
++        toolName: "shell_command",
++        result: [{ type: "text", text: "probe" }],
++      },
++    });
++  }
+   emit({
+     type: "event",
+     event: { type: "message_update", content: [{ type: "text", text: "Hola, mundo" }] },

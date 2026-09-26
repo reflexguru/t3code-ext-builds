@@ -16,7 +16,7 @@ configured later.
   [pingdotgg/t3code#10861](https://github.com/pingdotgg/t3code/pull/10861) (the
   Command Code provider driver) and
   [pingdotgg/t3code#11973](https://github.com/pingdotgg/t3code/pull/11973) (the
-  Oh My Pi driver), plus the local mid-turn steer patch in `patches/prs/`.
+  Oh My Pi driver), plus the local patches in `patches/prs/`.
 - **`v2`** builds
   [pingdotgg/t3code#2829](https://github.com/pingdotgg/t3code/pull/2829) (the new
   orchestrator) and nothing else. That stack carries the **Pi** coding agent
@@ -69,6 +69,7 @@ at all, so the two v2 flavours are the same branch with and without ports.
 | Patch | Why |
 | --- | --- |
 | `patches/prs/0001-command-code-steer-on-mid-turn-send.patch` | PR #10861 rejects any `sendTurn` that arrives while a turn is running (`a turn is already running for this thread`), so a message typed mid-turn is dropped; it also reports a signal-killed child (Stop) as a provider process failure. The patch steers the message into the running turn, keeps Stop a clean abort, and names any mid-turn messages a turn ends up never delivering. |
+| `patches/prs/0002-command-code-tool-work-log-payloads.patch` | PR #10861 omits `title`, `detail`, and `data.toolCallId` on completed/failed/declined tool events, so the work log falls back to a generic **Tool** row with no path or command. The patch keeps the queued args, humanizes the title, and puts structured `data` on every lifecycle event. |
 | `patches/v2-prs/0001-acp-bundled-oh-my-pi-entry.patch` | Oh My Pi is ACP-native but its official ACP Registry entry is still pending, so the Registry flow cannot offer it. The patch ships the entry with the app (`bundledAcpAgents.ts`) and merges bundled entries behind fetched ones, so the official listing takes over automatically once it is published. |
 | `patches/v2-prs/0002-command-code-provider.patch` | The Command Code provider, ported to the v2 interfaces: driver, `CommandCodeAdapterV2`, NDJSON protocol, model catalog, snapshot, text generation, contracts schema, and the settings-UI definition. Mid-turn sends are steered into the running turn by the v2 orchestrator (`supportsActiveSteering`), with the queueing implemented in the adapter because the CLI takes one prompt per process. |
 

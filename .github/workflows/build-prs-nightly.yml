@@ -1,7 +1,7 @@
 name: Build T3 Code + pull requests nightly (Windows)
 
 # Builds the upstream nightly from source with Command Code (#10861) and
-# Oh My Pi (#11973) layered on top, plus the local mid-turn steer patch,
+# Oh My Pi (#11973) layered on top, plus the local Command Code patches,
 # and publishes a Windows NSIS installer.
 
 on:
