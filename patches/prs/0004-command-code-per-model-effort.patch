@@ -1,0 +1,576 @@
+Command Code: advertise each model's real --effort levels.
+
+Patch 0003 showed a Reasoning picker on every Command Code model with the
+full CLI set (low/medium/high/xhigh/max). The install's catalog is narrower
+than that: DeepSeek is high/max, Qwen 3.8 is low/medium/xhigh, and models
+whose Efforts cell is an em dash (Haiku, Kimi K2.7, ...) pick their own
+depth. --list-models does not print those sets.
+
+Read the Efforts column from the CLI's bundled models.md (next to the
+binary, or COMMAND_CODE_PROXY_MODELS_CATALOG), merge BYOK reasoningEfforts
+from ~/.commandcode/providers.json, and attach only that model's levels.
+Models with no catalogued efforts keep capabilities null so the composer
+hides the control instead of offering levels the CLI will reject.
+
+diff --git a/apps/server/src/provider/CommandCodeProvider.ts b/apps/server/src/provider/CommandCodeProvider.ts
+index 11d1ef5..774f79f 100644
+--- a/apps/server/src/provider/CommandCodeProvider.ts
++++ b/apps/server/src/provider/CommandCodeProvider.ts
+@@ -31,7 +31,7 @@ import {
+   COMMAND_CODE_LIST_MODELS_ARGS,
+   COMMAND_CODE_VERSION_ARGS,
+ } from "./commandCodeLaunchArgs.ts";
+-import { parseCommandCodeModelList } from "./commandCodeModels.ts";
++import { loadCommandCodeEffortCatalog, parseCommandCodeModelList } from "./commandCodeModels.ts";
+ import { makeManualOnlyProviderMaintenanceCapabilities } from "./providerMaintenance.ts";
+ import {
+   buildServerProvider,
+@@ -184,7 +184,21 @@ export function checkCommandCodeProvider(input: CommandCodeStatusCheckInput) {
+       });
+     }
+ 
+-    const models: ReadonlyArray<ServerProviderModel> = parseCommandCodeModelList(modelsRun.stdout);
++    const catalogBinary = yield* resolveSpawnCommand(
++      binaryPath,
++      [...COMMAND_CODE_LIST_MODELS_ARGS],
++      {
++        env: input.env,
++        extendEnv: true,
++      },
++    ).pipe(
++      Effect.map((resolved) => resolved.command),
++      Effect.catch(() => Effect.succeed(binaryPath)),
++    );
++    const models: ReadonlyArray<ServerProviderModel> = parseCommandCodeModelList(
++      modelsRun.stdout,
++      loadCommandCodeEffortCatalog(catalogBinary, input.env),
++    );
+     return buildServerProvider({
+       presentation: { displayName: "Command Code" },
+       enabled,
+diff --git a/apps/server/src/provider/commandCodeModels.test.ts b/apps/server/src/provider/commandCodeModels.test.ts
+index 81c1a78..fa4b7f1 100644
+--- a/apps/server/src/provider/commandCodeModels.test.ts
++++ b/apps/server/src/provider/commandCodeModels.test.ts
+@@ -1,9 +1,17 @@
++// @effect-diagnostics nodeBuiltinImport:off
++import * as NodeFS from "node:fs";
++import * as NodeOS from "node:os";
++import * as NodePath from "node:path";
+ import { describe, expect, it } from "vite-plus/test";
+ 
+ import {
+-  parseCommandCodeModelList,
+-  COMMAND_CODE_MODEL_CAPABILITIES,
++  commandCodeCapabilitiesForEfforts,
++  findCommandCodeModelsMd,
++  loadCommandCodeEffortCatalog,
+   normalizeCommandCodeEffort,
++  parseCommandCodeModelList,
++  parseCommandCodeModelsMd,
++  parseCommandCodeProvidersEfforts,
+ } from "./commandCodeModels.ts";
+ 
+ const SAMPLE_LIST = `Available models  ·  3 models
+@@ -18,6 +26,30 @@ Anthropic
+ claude-sonnet-5   best combo of speed & intelligence (recommended)
+ `;
+ 
++const SAMPLE_MODELS_MD = `<!-- Generated from the Command Code docs -->
++
++# Command Code Models
++
++## Open Source
++
++| Id (use EXACTLY this) | Name | Context | Efforts | $/1M in/out · cache read | Min plan | Best for |
++|---|---|---|---|---|---|---|
++| \`deepseek/deepseek-v4-flash\` | DeepSeek V4 Flash (latest) | 1M | high, max | $0.15/$0.6 | Go and above | fast hybrid-attention reasoning |
++| \`z-ai/glm-5.3-flash\` | GLM-5.3 Flash | 1.05M | low, high, max | $0.15/$0.5 | Go and above | fast, affordable GLM coding |
++| \`moonshotai/Kimi-K2.7-Code\` | Kimi K2.7 Code | 256K | — | $0.95/$4 | Go and above | improved long-horizon coding |
++| \`Qwen/Qwen3.8-Flash\` | Qwen 3.8 Flash | 1M | low, medium, xhigh | $0.16/$0.47 | Go and above | fast low-cost agentic coding |
++## Anthropic
++
++| Id (use EXACTLY this) | Name | Context | Efforts | $/1M in/out · cache read | Min plan | Best for |
++|---|---|---|---|---|---|---|
++| \`claude-sonnet-5\` | Claude Sonnet 5 | 1M | low, medium, high, xhigh, max | $2/$10 | Pro and above | best combo of speed & intelligence |
++| \`claude-haiku-4-5-20251001\` | Claude Haiku 4.5 | 200K | — | $1/$5 | Pro and above | fastest & most compact |
++`;
++
++function effortIds(capabilities: { optionDescriptors?: ReadonlyArray<{ options?: ReadonlyArray<{ id: string }> }> } | null) {
++  return capabilities?.optionDescriptors?.[0]?.options?.map((option) => option.id) ?? [];
++}
++
+ describe("parseCommandCodeModelList", () => {
+   it("parses slugs and drops category headers", () => {
+     const models = parseCommandCodeModelList(SAMPLE_LIST);
+@@ -26,13 +58,9 @@ describe("parseCommandCodeModelList", () => {
+       "z-ai/glm-5.3-flash",
+       "claude-sonnet-5",
+     ]);
+-    expect(
+-      models.every(
+-        (model) =>
+-          model.isCustom === false && model.capabilities === COMMAND_CODE_MODEL_CAPABILITIES,
+-      ),
+-    ).toBe(true);
+-    expect(COMMAND_CODE_MODEL_CAPABILITIES.optionDescriptors?.[0]?.id).toBe("effort");
++    expect(models.every((model) => model.isCustom === false && model.capabilities === null)).toBe(
++      true,
++    );
+   });
+ 
+   it("marks the explicitly-default row, not the first row", () => {
+@@ -65,9 +93,96 @@ describe("parseCommandCodeModelList", () => {
+     expect(parseCommandCodeModelList("Anthropic\n\nOpen Source\n")).toEqual([]);
+   });
+ 
++  it("attaches each model's catalogued efforts and hides the picker when none", () => {
++    const models = parseCommandCodeModelList(SAMPLE_LIST, parseCommandCodeModelsMd(SAMPLE_MODELS_MD));
++    expect(effortIds(models[0]!.capabilities)).toEqual(["high", "max"]);
++    expect(effortIds(models[1]!.capabilities)).toEqual(["low", "high", "max"]);
++    expect(effortIds(models[2]!.capabilities)).toEqual(["low", "medium", "high", "xhigh", "max"]);
++    expect(models[0]!.capabilities?.optionDescriptors?.[0]?.currentValue).toBe("high");
++  });
++
+   it("normalizes CLI effort tokens and rejects unknown values", () => {
+     expect(normalizeCommandCodeEffort(" High ")).toBe("high");
+     expect(normalizeCommandCodeEffort("xhigh")).toBe("xhigh");
+     expect(normalizeCommandCodeEffort("turbo")).toBeUndefined();
+   });
+ });
++
++describe("parseCommandCodeModelsMd", () => {
++  it("reads the Efforts column and treats an em dash as no picker", () => {
++    const catalog = parseCommandCodeModelsMd(SAMPLE_MODELS_MD);
++    expect(catalog.get("deepseek/deepseek-v4-flash")).toEqual(["high", "max"]);
++    expect(catalog.get("qwen/qwen3.8-flash")).toEqual(["low", "medium", "xhigh"]);
++    expect(catalog.get("claude-sonnet-5")).toEqual(["low", "medium", "high", "xhigh", "max"]);
++    expect(catalog.get("moonshotai/kimi-k2.7-code")).toEqual([]);
++    expect(catalog.get("claude-haiku-4-5-20251001")).toEqual([]);
++  });
++});
++
++describe("commandCodeCapabilitiesForEfforts", () => {
++  it("defaults to high when present, otherwise the last catalogued level", () => {
++    const qwen = commandCodeCapabilitiesForEfforts(["low", "medium", "xhigh"]);
++    expect(effortIds(qwen)).toEqual(["low", "medium", "xhigh"]);
++    expect(qwen?.optionDescriptors?.[0]?.currentValue).toBe("xhigh");
++    expect(qwen?.optionDescriptors?.[0]?.options?.find((option) => option.isDefault)?.id).toBe(
++      "xhigh",
++    );
++    expect(commandCodeCapabilitiesForEfforts([])).toBeNull();
++    expect(commandCodeCapabilitiesForEfforts(undefined)).toBeNull();
++  });
++});
++
++describe("parseCommandCodeProvidersEfforts", () => {
++  it("reads BYOK reasoningEfforts from providers.json", () => {
++    const catalog = parseCommandCodeProvidersEfforts(`{
++      "provider": {
++        "novita": {
++          "models": {
++            "qwen/qwen3.6-27b": { "reasoningEfforts": ["low", "high"] },
++            "llama3.3:70b": {}
++          }
++        }
++      }
++    }`);
++    expect(catalog.get("qwen/qwen3.6-27b")).toEqual(["low", "high"]);
++    expect(catalog.has("llama3.3:70b")).toBe(false);
++  });
++});
++
++describe("loadCommandCodeEffortCatalog", () => {
++  it("loads models.md from COMMAND_CODE_PROXY_MODELS_CATALOG and merges BYOK", () => {
++    const root = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "cc-effort-"));
++    try {
++      const mdPath = NodePath.join(root, "models.md");
++      NodeFS.writeFileSync(mdPath, SAMPLE_MODELS_MD, "utf8");
++      const home = NodePath.join(root, "home");
++      NodeFS.mkdirSync(NodePath.join(home, ".commandcode"), { recursive: true });
++      NodeFS.writeFileSync(
++        NodePath.join(home, ".commandcode", "providers.json"),
++        JSON.stringify({
++          provider: {
++            novita: {
++              models: {
++                "acme/custom": { reasoningEfforts: ["medium", "max"] },
++              },
++            },
++          },
++        }),
++        "utf8",
++      );
++      const catalog = loadCommandCodeEffortCatalog("command-code", {
++        COMMAND_CODE_PROXY_MODELS_CATALOG: mdPath,
++        HOME: home,
++        USERPROFILE: home,
++        PATH: "",
++      });
++      expect(catalog.get("deepseek/deepseek-v4-flash")).toEqual(["high", "max"]);
++      expect(catalog.get("acme/custom")).toEqual(["medium", "max"]);
++      expect(findCommandCodeModelsMd("command-code", { COMMAND_CODE_PROXY_MODELS_CATALOG: mdPath })).toBe(
++        mdPath,
++      );
++    } finally {
++      NodeFS.rmSync(root, { recursive: true, force: true });
++    }
++  });
++});
+diff --git a/apps/server/src/provider/commandCodeModels.ts b/apps/server/src/provider/commandCodeModels.ts
+index 15c7d47..a1c286b 100644
+--- a/apps/server/src/provider/commandCodeModels.ts
++++ b/apps/server/src/provider/commandCodeModels.ts
+@@ -1,24 +1,22 @@
+ /**
+  * commandCodeModels — parse `command-code --list-models` output into the
+- * snapshot's model list.
++ * snapshot's model list, and attach each model's real `--effort` levels from
++ * the CLI's bundled `models.md` catalog (and BYOK `providers.json`).
+  *
+  * Command Code owns its own model routing (plan catalog plus BYOK providers,
+  * some of which are other vendors' models), so T3 never hardcodes a catalog:
+  * whatever the local CLI can select is what the snapshot advertises.
+  *
+- * `--list-models` prints a human table:
+- *
+- * ```
+- * Available models  ·  69 models
+- *
+- * Open Source
+- *
+- * deepseek/deepseek-v4-flash   fast hybrid-attention reasoning (default)
+- * ...
+- * ```
++ * `--list-models` prints a human table of ids the install can select.
++ * Reasoning levels live beside the binary in
++ * `dist/bundled/command-code-knowledge/reference/models.md` (Efforts column).
++ * Models whose catalog cell is `—` decide their own depth; those get no picker.
+  *
+  * @module provider/commandCodeModels
+  */
++// @effect-diagnostics nodeBuiltinImport:off
++import * as NodeFS from "node:fs";
++import * as NodePath from "node:path";
+ import type { ModelCapabilities, ServerProviderModel } from "@t3tools/contracts";
+ import { createModelCapabilities } from "@t3tools/shared/model";
+ 
+@@ -27,6 +25,19 @@ const ANSI_ESCAPE_REGEX = /\u001b\[[0-9;]*m/g;
+ /** Slug charset: letters, digits, and the separators real ids use (`/`, `:`, `.`, `-`, `_`, `+`). */
+ const MODEL_SLUG_REGEX = /^[A-Za-z0-9][A-Za-z0-9._:+@/-]*$/;
+ 
++const MODELS_MD_RELATIVE = "dist/bundled/command-code-knowledge/reference/models.md";
++
++export const COMMAND_CODE_EFFORT_VALUES = ["low", "medium", "high", "xhigh", "max"] as const;
++export type CommandCodeEffort = (typeof COMMAND_CODE_EFFORT_VALUES)[number];
++
++const EFFORT_LABELS: Readonly<Record<CommandCodeEffort, string>> = {
++  low: "Low",
++  medium: "Medium",
++  high: "High",
++  xhigh: "Extra High",
++  max: "Max",
++};
++
+ function stripAnsi(value: string): string {
+   return value.replace(ANSI_ESCAPE_REGEX, "");
+ }
+@@ -42,33 +53,6 @@ function isCategoryHeader(slug: string, note: string | undefined): boolean {
+   return /^[A-Z]/.test(slug) && !slug.includes("/") && !slug.includes(":");
+ }
+ 
+-/** CLI `--effort` / `/effort` levels advertised in Command Code settings. */
+-export const COMMAND_CODE_EFFORT_VALUES = ["low", "medium", "high", "xhigh", "max"] as const;
+-export type CommandCodeEffort = (typeof COMMAND_CODE_EFFORT_VALUES)[number];
+-
+-/**
+- * Reasoning control shown on every Command Code model. The CLI accepts these
+- * values on `--effort`; the picker is advertised for all models so T3 matches
+- * other providers instead of hiding the control.
+- */
+-export const COMMAND_CODE_MODEL_CAPABILITIES: ModelCapabilities = createModelCapabilities({
+-  optionDescriptors: [
+-    {
+-      id: "effort",
+-      label: "Reasoning",
+-      type: "select",
+-      currentValue: "high",
+-      options: [
+-        { id: "low", label: "Low" },
+-        { id: "medium", label: "Medium" },
+-        { id: "high", label: "High", isDefault: true },
+-        { id: "xhigh", label: "Extra High" },
+-        { id: "max", label: "Max" },
+-      ],
+-    },
+-  ],
+-});
+-
+ export function normalizeCommandCodeEffort(
+   value: string | undefined,
+ ): CommandCodeEffort | undefined {
+@@ -79,7 +63,254 @@ export function normalizeCommandCodeEffort(
+     : undefined;
+ }
+ 
+-export function parseCommandCodeModelList(output: string): ReadonlyArray<ServerProviderModel> {
++function catalogKey(slug: string): string {
++  return slug.trim().toLowerCase();
++}
++
++function extractBacktickContent(cell: string): string | undefined {
++  const start = cell.indexOf("`");
++  if (start < 0) return undefined;
++  const end = cell.indexOf("`", start + 1);
++  if (end < 0) return undefined;
++  const id = cell.slice(start + 1, end).trim();
++  return id.length > 0 ? id : undefined;
++}
++
++function isEmptyEffortCell(value: string): boolean {
++  const trimmed = value.trim();
++  return trimmed.length === 0 || trimmed === "—" || trimmed === "-" || trimmed === "–";
++}
++
++function parseEffortList(value: string): CommandCodeEffort[] {
++  if (isEmptyEffortCell(value)) return [];
++  const seen = new Set<CommandCodeEffort>();
++  const efforts: CommandCodeEffort[] = [];
++  for (const part of value.split(",")) {
++    const effort = normalizeCommandCodeEffort(part);
++    if (effort === undefined || seen.has(effort)) continue;
++    seen.add(effort);
++    efforts.push(effort);
++  }
++  return efforts;
++}
++
++/** Build composer capabilities for one model's catalogued `--effort` set. */
++export function commandCodeCapabilitiesForEfforts(
++  efforts: ReadonlyArray<string> | undefined,
++): ModelCapabilities | null {
++  const options = (efforts ?? [])
++    .map((value) => normalizeCommandCodeEffort(value))
++    .filter((value): value is CommandCodeEffort => value !== undefined)
++    .map((id) => ({
++      id,
++      label: EFFORT_LABELS[id],
++    }));
++  if (options.length === 0) return null;
++  const defaultId =
++    options.find((option) => option.id === "high")?.id ?? options[options.length - 1]!.id;
++  return createModelCapabilities({
++    optionDescriptors: [
++      {
++        id: "effort",
++        label: "Reasoning",
++        type: "select",
++        currentValue: defaultId,
++        options: options.map((option) => ({
++          ...option,
++          ...(option.id === defaultId ? { isDefault: true } : {}),
++        })),
++      },
++    ],
++  });
++}
++
++/**
++ * Parse the CLI's bundled `models.md` Efforts column. Keys are lowercased
++ * model ids so `--list-models` slugs match case-insensitively.
++ */
++export function parseCommandCodeModelsMd(
++  content: string,
++): ReadonlyMap<string, ReadonlyArray<CommandCodeEffort>> {
++  const catalog = new Map<string, ReadonlyArray<CommandCodeEffort>>();
++  for (const rawLine of content.split(/\r?\n/)) {
++    const line = rawLine.trim();
++    if (!line.startsWith("|") || !line.includes("`") || /^\|[\s:-|]+$/.test(line)) {
++      continue;
++    }
++    const cols = line
++      .split("|")
++      .map((cell) => cell.trim())
++      .filter((cell) => cell.length > 0);
++    if (cols.length < 4) continue;
++    const slug = extractBacktickContent(cols[0]!);
++    if (slug === undefined || !MODEL_SLUG_REGEX.test(slug)) continue;
++    catalog.set(catalogKey(slug), parseEffortList(cols[3]!));
++  }
++  return catalog;
++}
++
++/**
++ * BYOK `~/.commandcode/providers.json` may declare `reasoningEfforts` per
++ * custom model. Those ids show up in `--list-models` but not in `models.md`.
++ */
++export function parseCommandCodeProvidersEfforts(
++  content: string,
++): ReadonlyMap<string, ReadonlyArray<CommandCodeEffort>> {
++  const catalog = new Map<string, ReadonlyArray<CommandCodeEffort>>();
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(content) as unknown;
++  } catch {
++    return catalog;
++  }
++  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
++    return catalog;
++  }
++  const root = parsed as Record<string, unknown>;
++  const providers =
++    root["provider"] !== null && typeof root["provider"] === "object" && !Array.isArray(root["provider"])
++      ? (root["provider"] as Record<string, unknown>)
++      : root;
++  for (const provider of Object.values(providers)) {
++    if (provider === null || typeof provider !== "object" || Array.isArray(provider)) continue;
++    const models = (provider as Record<string, unknown>)["models"];
++    if (models === null || typeof models !== "object" || Array.isArray(models)) continue;
++    for (const [slug, spec] of Object.entries(models as Record<string, unknown>)) {
++      if (!MODEL_SLUG_REGEX.test(slug)) continue;
++      if (spec === null || typeof spec !== "object" || Array.isArray(spec)) continue;
++      const raw = (spec as Record<string, unknown>)["reasoningEfforts"];
++      if (!Array.isArray(raw)) continue;
++      const efforts = parseEffortList(raw.filter((entry) => typeof entry === "string").join(","));
++      catalog.set(catalogKey(slug), efforts);
++    }
++  }
++  return catalog;
++}
++
++function existingFile(path: string, seen: Set<string>): string | null {
++  const normalized = NodePath.normalize(path);
++  if (seen.has(normalized)) return null;
++  seen.add(normalized);
++  try {
++    return NodeFS.statSync(normalized).isFile() ? normalized : null;
++  } catch {
++    return null;
++  }
++}
++
++/** Locate the CLI's bundled `models.md` from a binary path, PATH, or env override. */
++export function findCommandCodeModelsMd(
++  binaryPath: string,
++  env: NodeJS.ProcessEnv = process.env,
++): string | null {
++  const override = env["COMMAND_CODE_PROXY_MODELS_CATALOG"]?.trim();
++  if (override) {
++    try {
++      if (NodeFS.statSync(override).isFile()) return override;
++    } catch {
++      // Fall through to install-relative lookup.
++    }
++  }
++
++  const seen = new Set<string>();
++  const roots: string[] = [];
++  const addRoot = (value: string | undefined) => {
++    if (value === undefined || value.length === 0) return;
++    const resolved = NodePath.resolve(value);
++    if (!roots.includes(resolved)) roots.push(resolved);
++  };
++
++  if (binaryPath.includes("/") || binaryPath.includes("\\") || NodePath.isAbsolute(binaryPath)) {
++    addRoot(NodePath.dirname(NodePath.resolve(binaryPath)));
++  }
++
++  const pathDirs = (env["PATH"] ?? env["Path"] ?? "").split(NodePath.delimiter);
++  const names = ["command-code", "cmdc", "commandcode"];
++  const exts =
++    process.platform === "win32" ? [".cmd", ".exe", ".ps1", ""] : ["", ".cmd", ".exe"];
++  for (const dir of pathDirs) {
++    if (dir.length === 0) continue;
++    for (const name of names) {
++      for (const ext of exts) {
++        const candidate = NodePath.join(dir, `${name}${ext}`);
++        try {
++          if (NodeFS.statSync(candidate).isFile()) addRoot(NodePath.dirname(candidate));
++        } catch {
++          // Not this PATH entry.
++        }
++      }
++    }
++  }
++
++  const relatives = [
++    MODELS_MD_RELATIVE,
++    `bundled/command-code-knowledge/reference/models.md`,
++    `command-code/${MODELS_MD_RELATIVE}`,
++    `node_modules/command-code/${MODELS_MD_RELATIVE}`,
++    `../command-code/${MODELS_MD_RELATIVE}`,
++    `../node_modules/command-code/${MODELS_MD_RELATIVE}`,
++    `lib/node_modules/command-code/${MODELS_MD_RELATIVE}`,
++  ];
++
++  for (const root of roots) {
++    let dir = root;
++    for (let depth = 0; depth < 8; depth += 1) {
++      for (const relative of relatives) {
++        const hit = existingFile(NodePath.join(dir, relative), seen);
++        if (hit !== null) return hit;
++      }
++      const parent = NodePath.dirname(dir);
++      if (parent === dir) break;
++      dir = parent;
++    }
++  }
++  return null;
++}
++
++function mergeCatalog(
++  target: Map<string, ReadonlyArray<CommandCodeEffort>>,
++  extra: ReadonlyMap<string, ReadonlyArray<CommandCodeEffort>>,
++): void {
++  for (const [slug, efforts] of extra) {
++    target.set(slug, efforts);
++  }
++}
++
++/** Load per-model effort sets from the local CLI catalog and BYOK providers. */
++export function loadCommandCodeEffortCatalog(
++  binaryPath: string,
++  env: NodeJS.ProcessEnv = process.env,
++): ReadonlyMap<string, ReadonlyArray<CommandCodeEffort>> {
++  const catalog = new Map<string, ReadonlyArray<CommandCodeEffort>>();
++  const mdPath = findCommandCodeModelsMd(binaryPath, env);
++  if (mdPath !== null) {
++    try {
++      mergeCatalog(catalog, parseCommandCodeModelsMd(NodeFS.readFileSync(mdPath, "utf8")));
++    } catch {
++      // Unreadable catalog: list models without effort pickers.
++    }
++  }
++  const home = env["HOME"] ?? env["USERPROFILE"];
++  if (home !== undefined && home.length > 0) {
++    const providersPath = NodePath.join(home, ".commandcode", "providers.json");
++    try {
++      if (NodeFS.statSync(providersPath).isFile()) {
++        mergeCatalog(
++          catalog,
++          parseCommandCodeProvidersEfforts(NodeFS.readFileSync(providersPath, "utf8")),
++        );
++      }
++    } catch {
++      // Missing or invalid BYOK file is not a probe failure.
++    }
++  }
++  return catalog;
++}
++
++export function parseCommandCodeModelList(
++  output: string,
++  catalog?: ReadonlyMap<string, ReadonlyArray<CommandCodeEffort>>,
++): ReadonlyArray<ServerProviderModel> {
+   const rows: Array<{ readonly slug: string; readonly note: string | undefined }> = [];
+   const seen = new Set<string>();
+ 
+@@ -111,7 +342,7 @@ export function parseCommandCodeModelList(output: string): ReadonlyArray<ServerP
+       // capability prose, and the picker searches both fields anyway.
+       name: row.slug,
+       isCustom: false,
+-      capabilities: COMMAND_CODE_MODEL_CAPABILITIES,
++      capabilities: commandCodeCapabilitiesForEfforts(catalog?.get(catalogKey(row.slug))),
+       ...(isDefault ? { isDefault: true } : {}),
+     };
+   });
